@@ -1,0 +1,829 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 274dffa179..5677df9a2b 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -1,6 +1,13 @@
+ // Copyright 2020 The Chromium Authors
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
++//
++// CUSTOMIZED (mini_browser): this Mac platform delegate has been modified to
++// give content_shell a single window with a vertical tab strip on the left,
++// instead of one native window per page. Each Shell/WebContents becomes a tab;
++// the active tab's web view is shown in the content area and the toolbar
++// retargets to whichever tab is active. The change is contained entirely to
++// this file (no changes to the Shell core or headers).
+ 
+ #include "content/shell/browser/shell_platform_delegate.h"
+ 
+@@ -14,6 +21,7 @@
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "components/input/native_web_keyboard_event.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+@@ -23,103 +31,486 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "url/gurl.h"
+ 
+-// Receives notification that the window is closing so that it can start the
+-// tear-down process.
+-@interface ContentShellWindowDelegate : NSObject <NSWindowDelegate>
++namespace {
+ 
+-@property(readonly) NSWindow* window;
++NSString* const kWindowTitle = @"Content Shell";
++
++// Layout constants (in view coordinates).
++const CGFloat kButtonWidth = 72;
++const CGFloat kURLBarHeight = 24;
++const CGFloat kSidebarWidth = 180;
++const CGFloat kTabRowHeight = 30;
++const CGFloat kCloseButtonWidth = 24;
++
++// The minimum size of the window's content (in view coordinates).
++const CGFloat kMinimumWindowWidth = 600;
++const CGFloat kMinimumWindowHeight = 400;
++
++}  // namespace
+ 
+-- (id)initWithShell:(content::Shell*)shell window:(NSWindow*)window;
+-- (void)showDevTools:(id)sender;
++// A view whose coordinate origin is the top-left, so the tab strip stacks
++// downward naturally.
++@interface FlippedView : NSView
++@end
+ 
++@implementation FlippedView
++- (BOOL)isFlipped {
++  return YES;
++}
+ @end
+ 
+-@implementation ContentShellWindowDelegate {
+-  raw_ptr<content::Shell> _shell;
+-  NSWindow* __strong _window;
++// Bookkeeping for a single tab.
++@interface TabInfo : NSObject {
++ @public
++  raw_ptr<content::Shell> shell;  // Not owned; the Shell is self-owning.
++  __weak NSView* webView;         // Owned by the WebContents / view hierarchy.
++  NSView* rowView;                // The sidebar row container (owned by strip).
++  NSButton* titleButton;
++  NSButton* closeButton;
+ }
++@end
++
++@implementation TabInfo
++@end
++
++// Owns the single shared browser window and the vertical tab strip. There is
++// one instance for the whole process (stored in g_tab_controller), matching the
++// single process-wide ShellPlatformDelegate.
++@interface TabbedShellController : NSObject <NSWindowDelegate> {
++  NSWindow* _window;
++  FlippedView* _sidebar;
++  NSButton* _newTabButton;
++  NSView* _contentContainer;
++  NSButton* _backButton;
++  NSButton* _forwardButton;
++  NSButton* _reloadButton;
++  NSButton* _stopButton;
++  NSTextField* _urlField;
++  NSMutableArray<TabInfo*>* _tabs;
++  TabInfo* _activeTab;
++  BOOL _closingAll;
++  BOOL _hideToolbar;
++  // When set, the next tab created is brought to the foreground (used by the
++  // "+ New Tab" button). Link/script-opened tabs (e.g. cmd+click) stay in the
++  // background and flash the strip instead.
++  BOOL _foregroundNextTab;
++}
++@property(readonly) NSWindow* window;
++- (instancetype)initWithContentSize:(NSSize)size;
++- (void)addTabForShell:(content::Shell*)shell;
++- (void)attachContentsForShell:(content::Shell*)shell;
++- (void)removeTabForShell:(content::Shell*)shell;
++- (TabInfo*)tabForShell:(content::Shell*)shell;
++- (content::Shell*)activeShell;
++- (void)setURLString:(NSString*)s forShell:(content::Shell*)shell;
++- (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell;
++- (void)setEnabled:(BOOL)enabled
++       forControlId:(int)controlId
++              shell:(content::Shell*)shell;
++- (void)focusURLField;
++@end
++
++namespace {
++// The single shared controller for the whole process. Strong under ARC.
++TabbedShellController* g_tab_controller = nil;
++}  // namespace
++
++@implementation TabbedShellController
+ 
+ @synthesize window = _window;
+ 
+-- (id)initWithShell:(content::Shell*)shell window:(NSWindow*)window {
+-  if ((self = [super init])) {
+-    _shell = shell;
+-    _window = window;
+-    window.delegate = self;
++- (instancetype)initWithContentSize:(NSSize)size {
++  if (!(self = [super init]))
++    return nil;
++
++  _tabs = [[NSMutableArray alloc] init];
++  _hideToolbar = content::Shell::ShouldHideToolbar();
++
++  CGFloat toolbarHeight = _hideToolbar ? 0 : kURLBarHeight;
++  CGFloat contentW = kSidebarWidth + size.width;
++  CGFloat contentH = toolbarHeight + size.height;
++
++  NSRect contentRect = NSMakeRect(0, 0, contentW, contentH);
++  NSUInteger styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
++                         NSWindowStyleMaskMiniaturizable |
++                         NSWindowStyleMaskResizable;
++  _window = [[NSWindow alloc] initWithContentRect:contentRect
++                                        styleMask:styleMask
++                                          backing:NSBackingStoreBuffered
++                                            defer:NO];
++  _window.title = kWindowTitle;
++  _window.releasedWhenClosed = NO;  // ARC owns the window via this controller.
++  _window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
++  _window.contentMinSize =
++      NSMakeSize(kMinimumWindowWidth, kMinimumWindowHeight);
++  _window.delegate = self;
++
++  NSView* content = _window.contentView;
++
++  // Left sidebar (flipped so tab rows stack top-to-bottom). Pinned to the left
++  // edge, full height. We lay out its children manually.
++  _sidebar = [[FlippedView alloc]
++      initWithFrame:NSMakeRect(0, 0, kSidebarWidth, contentH)];
++  _sidebar.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
++  _sidebar.autoresizesSubviews = NO;
++  // No custom background: let the sidebar show the same (appearance-adaptive)
++  // window background as the toolbar area, so button text stays readable in
++  // both light and dark mode.
++  [content addSubview:_sidebar];
++
++  // "+ New Tab" button at the top of the sidebar.
++  _newTabButton = [[NSButton alloc]
++      initWithFrame:NSMakeRect(0, 0, kSidebarWidth, kTabRowHeight)];
++  _newTabButton.title = @"+ New Tab";
++  _newTabButton.bezelStyle = NSBezelStyleSmallSquare;
++  _newTabButton.target = self;
++  _newTabButton.action = @selector(newTab:);
++  [_sidebar addSubview:_newTabButton];
++
++  // Content container on the right (holds the web views; only the active one is
++  // visible).
++  _contentContainer = [[NSView alloc]
++      initWithFrame:NSMakeRect(kSidebarWidth, 0, size.width, size.height)];
++  _contentContainer.autoresizingMask =
++      NSViewWidthSizable | NSViewHeightSizable;
++  [content addSubview:_contentContainer];
++
++  if (!_hideToolbar) {
++    // Navigation buttons + URL field along the top of the content area.
++    NSRect r = NSMakeRect(kSidebarWidth, contentH - kURLBarHeight, kButtonWidth,
++                          kURLBarHeight);
++    _backButton = [self makeToolbarButton:@"Back"
++                                    frame:r
++                                      tag:IDC_NAV_BACK
++                                      key:@"["];
++    r.origin.x += kButtonWidth;
++    _forwardButton = [self makeToolbarButton:@"Forward"
++                                       frame:r
++                                         tag:IDC_NAV_FORWARD
++                                         key:@"]"];
++    r.origin.x += kButtonWidth;
++    _reloadButton = [self makeToolbarButton:@"Reload"
++                                      frame:r
++                                        tag:IDC_NAV_RELOAD
++                                        key:@"r"];
++    r.origin.x += kButtonWidth;
++    _stopButton = [self makeToolbarButton:@"Stop"
++                                    frame:r
++                                      tag:IDC_NAV_STOP
++                                      key:@"."];
++    r.origin.x += kButtonWidth;
++
++    r.size.width = contentW - NSMinX(r);
++    _urlField = [[NSTextField alloc] initWithFrame:r];
++    _urlField.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
++    _urlField.target = self;
++    _urlField.action = @selector(urlEntered:);
++    _urlField.cell.wraps = NO;
++    _urlField.cell.scrollable = YES;
++    [content addSubview:_urlField];
+   }
++
++  [_window makeKeyAndOrderFront:nil];
+   return self;
+ }
+ 
+-// Called when the window is about to close. Perform the self-destruction
+-// sequence by getting rid of the shell and removing it and the window from
+-// the various global lists. By returning YES, we allow the window to be
+-// removed from the screen.
+-- (BOOL)windowShouldClose:(id)sender {
+-  CHECK_EQ(base::apple::ObjCCastStrict<NSWindow>(sender), _window);
+-  // Don't leave a dangling pointer if the window lives beyond
+-  // this method. See crbug.com/719830.
+-  _window.delegate = nil;
+-  _window = nil;
+-  _shell.ClearAndDelete();
++- (NSButton*)makeToolbarButton:(NSString*)title
++                         frame:(NSRect)frame
++                           tag:(int)tag
++                           key:(NSString*)key {
++  NSButton* button = [[NSButton alloc] initWithFrame:frame];
++  button.title = title;
++  button.bezelStyle = NSBezelStyleSmallSquare;
++  button.autoresizingMask = NSViewMinYMargin | NSViewMaxXMargin;
++  button.target = self;
++  button.action = @selector(navAction:);
++  button.tag = tag;
++  button.keyEquivalent = key;
++  button.keyEquivalentModifierMask = NSEventModifierFlagCommand;
++  [_window.contentView addSubview:button];
++  return button;
++}
+ 
+-  return YES;
++// Positions the New Tab button and all tab rows within the sidebar.
++- (void)layoutTabRows {
++  _newTabButton.frame = NSMakeRect(0, 0, kSidebarWidth, kTabRowHeight);
++  CGFloat y = kTabRowHeight;
++  for (TabInfo* tab in _tabs) {
++    tab->rowView.frame = NSMakeRect(0, y, kSidebarWidth, kTabRowHeight);
++    tab->titleButton.frame =
++        NSMakeRect(0, 0, kSidebarWidth - kCloseButtonWidth, kTabRowHeight);
++    tab->closeButton.frame = NSMakeRect(kSidebarWidth - kCloseButtonWidth, 0,
++                                        kCloseButtonWidth, kTabRowHeight);
++    y += kTabRowHeight;
++  }
+ }
+ 
+-- (void)performAction:(id)sender {
+-  _shell->ActionPerformed([sender tag]);
++- (TabInfo*)tabForShell:(content::Shell*)shell {
++  for (TabInfo* tab in _tabs) {
++    if (tab->shell == shell)
++      return tab;
++  }
++  return nil;
+ }
+ 
+-- (void)takeURLStringValueFrom:(id)sender {
+-  _shell->URLEntered(base::SysNSStringToUTF8([sender stringValue]));
++- (content::Shell*)activeShell {
++  return _activeTab ? _activeTab->shell : nullptr;
+ }
+ 
+-- (void)showDevTools:(id)sender {
+-  _shell->ShowDevTools();
++- (void)addTabForShell:(content::Shell*)shell {
++  TabInfo* tab = [[TabInfo alloc] init];
++  tab->shell = shell;
++
++  tab->rowView = [[NSView alloc] initWithFrame:NSZeroRect];
++  tab->rowView.wantsLayer = YES;
++
++  tab->titleButton = [[NSButton alloc] initWithFrame:NSZeroRect];
++  tab->titleButton.title = @"New Tab";
++  tab->titleButton.bordered = NO;
++  tab->titleButton.alignment = NSTextAlignmentLeft;
++  tab->titleButton.cell.lineBreakMode = NSLineBreakByTruncatingTail;
++  tab->titleButton.target = self;
++  tab->titleButton.action = @selector(tabClicked:);
++  [tab->rowView addSubview:tab->titleButton];
++
++  tab->closeButton = [[NSButton alloc] initWithFrame:NSZeroRect];
++  tab->closeButton.title = @"×";  // multiplication sign as a close glyph
++  tab->closeButton.bordered = NO;
++  tab->closeButton.target = self;
++  tab->closeButton.action = @selector(closeTabButton:);
++  [tab->rowView addSubview:tab->closeButton];
++
++  BOOL isFirst = (_tabs.count == 0);
++  [_sidebar addSubview:tab->rowView];
++  [_tabs addObject:tab];
++  [self layoutTabRows];
++
++  if (isFirst || _foregroundNextTab) {
++    [self activateTab:tab];
++  } else {
++    // A background tab (e.g. opened via cmd+click). Keep the current tab
++    // focused and flash the whole strip so the user sees that a tab was added
++    // (even if it landed below the scroll fold) without being yanked away.
++    [self flashSidebar];
++  }
++  _foregroundNextTab = NO;
+ }
+ 
+-@end
++// Subtle one-shot color pulse across the ENTIRE tab strip background, used to
++// signal a newly created background tab. Flashing the whole sidebar (rather than
++// just the new row) means the user still gets feedback even when the new tab is
++// appended below the visible/scrolled area. Implemented with AppKit's animator
++// (no Core Animation symbols, which the content_shell framework doesn't link): a
++// translucent accent overlay is placed behind the strip's controls and faded
++// out, then removed.
++- (void)flashSidebar {
++  NSView* overlay = [[NSView alloc] initWithFrame:_sidebar.bounds];
++  overlay.wantsLayer = YES;
++  overlay.layer.backgroundColor =
++      [NSColor.controlAccentColor colorWithAlphaComponent:0.4].CGColor;
++  overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  // Behind the New Tab button and all tab rows, so their labels stay legible.
++  [_sidebar addSubview:overlay positioned:NSWindowBelow relativeTo:nil];
++  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
++    context.duration = 0.85;
++    overlay.animator.alphaValue = 0.0;
++  }
++      completionHandler:^{
++        [overlay removeFromSuperview];
++      }];
++}
+ 
+-namespace {
++- (void)attachContentsForShell:(content::Shell*)shell {
++  TabInfo* tab = [self tabForShell:shell];
++  if (!tab)
++    return;
++  NSView* webView = shell->web_contents()->GetNativeView().GetNativeNSView();
++  webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  webView.frame = _contentContainer.bounds;
++  [_contentContainer addSubview:webView];
++  tab->webView = webView;
++  webView.hidden = (tab != _activeTab);
++  if (tab == _activeTab)
++    shell->web_contents()->WasShown();
++  else
++    shell->web_contents()->WasHidden();
++}
+ 
+-NSString* const kWindowTitle = @"Content Shell";
++- (void)activateTab:(TabInfo*)tab {
++  if (!tab || tab == _activeTab)
++    return;
+ 
+-// Layout constants (in view coordinates)
+-const CGFloat kButtonWidth = 72;
+-const CGFloat kURLBarHeight = 24;
++  if (_activeTab) {
++    _activeTab->webView.hidden = YES;
++    if (_activeTab->shell)
++      _activeTab->shell->web_contents()->WasHidden();
++    _activeTab->rowView.layer.backgroundColor = NSColor.clearColor.CGColor;
++  }
+ 
+-// The minimum size of the window's content (in view coordinates)
+-const CGFloat kMinimumWindowWidth = 400;
+-const CGFloat kMinimumWindowHeight = 300;
+-
+-void MakeShellButton(NSRect* rect,
+-                     NSString* title,
+-                     NSView* parent,
+-                     int control,
+-                     id target,
+-                     NSString* key,
+-                     NSUInteger modifier) {
+-  NSButton* button = [[NSButton alloc] initWithFrame:*rect];
+-  button.title = title;
+-  button.bezelStyle = NSBezelStyleSmallSquare;
+-  button.autoresizingMask = (NSViewMaxXMargin | NSViewMinYMargin);
+-  button.target = target;
+-  button.action = @selector(performAction:);
+-  button.tag = control;
+-  button.keyEquivalent = key;
+-  button.keyEquivalentModifierMask = modifier;
+-  [parent addSubview:button];
+-  rect->origin.x += kButtonWidth;
++  _activeTab = tab;
++  tab->webView.hidden = NO;
++  [tab->webView.superview addSubview:tab->webView
++                          positioned:NSWindowAbove
++                          relativeTo:nil];
++  if (tab->shell)
++    tab->shell->web_contents()->WasShown();
++  tab->rowView.layer.backgroundColor =
++      NSColor.selectedControlColor.CGColor;
++
++  // Retarget the toolbar to the newly active tab.
++  if (!_hideToolbar && tab->shell) {
++    GURL url = tab->shell->web_contents()->GetVisibleURL();
++    _urlField.stringValue = base::SysUTF8ToNSString(url.spec());
++    _window.title = tab->titleButton.title.length ? tab->titleButton.title
++                                                  : kWindowTitle;
++  }
+ }
+ 
+-}  // namespace
++- (void)removeTabForShell:(content::Shell*)shell {
++  if (_closingAll)
++    return;
++  TabInfo* tab = [self tabForShell:shell];
++  if (!tab)
++    return;
+ 
+-namespace content {
++  NSUInteger index = [_tabs indexOfObject:tab];
++  [tab->webView removeFromSuperview];
++  [tab->rowView removeFromSuperview];
++  tab->shell = nullptr;
++  [_tabs removeObject:tab];
++
++  if (tab == _activeTab) {
++    _activeTab = nil;
++    if (_tabs.count > 0) {
++      NSUInteger next = std::min(static_cast<NSUInteger>(index),
++                                 static_cast<NSUInteger>(_tabs.count - 1));
++      [self activateTab:_tabs[next]];
++    }
++  }
++  [self layoutTabRows];
++
++  if (_tabs.count == 0) {
++    // The last tab closed; tear down the window. The Shell teardown that called
++    // us will fire DidCloseLastWindow() -> Shell::Shutdown() to quit the app.
++    _window.delegate = nil;
++    [_window close];
++    _window = nil;
++  }
++}
+ 
+-struct ShellPlatformDelegate::ShellData {
+-  ContentShellWindowDelegate* __strong delegate;
+-  NSTextField* __weak url_edit_view;
+-};
++- (void)setURLString:(NSString*)s forShell:(content::Shell*)shell {
++  if (_hideToolbar)
++    return;
++  if ([self tabForShell:shell] == _activeTab)
++    _urlField.stringValue = s;
++}
++
++- (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell {
++  TabInfo* tab = [self tabForShell:shell];
++  if (!tab)
++    return;
++  tab->titleButton.title = s.length ? s : @"Untitled";
++  if (tab == _activeTab)
++    _window.title = s.length ? s : kWindowTitle;
++}
+ 
++- (void)setEnabled:(BOOL)enabled
++      forControlId:(int)controlId
++             shell:(content::Shell*)shell {
++  if (_hideToolbar || [self tabForShell:shell] != _activeTab)
++    return;
++  switch (controlId) {
++    case IDC_NAV_BACK:
++      _backButton.enabled = enabled;
++      break;
++    case IDC_NAV_FORWARD:
++      _forwardButton.enabled = enabled;
++      break;
++    case IDC_NAV_STOP:
++      _stopButton.enabled = enabled;
++      break;
++    default:
++      break;
++  }
++}
++
++- (void)focusURLField {
++  if (!_hideToolbar)
++    [_window makeFirstResponder:_urlField];
++}
++
++// --- Actions ---------------------------------------------------------------
++
++- (void)navAction:(id)sender {
++  if (content::Shell* shell = [self activeShell])
++    shell->ActionPerformed([sender tag]);
++}
++
++- (void)urlEntered:(id)sender {
++  if (content::Shell* shell = [self activeShell])
++    shell->URLEntered(base::SysNSStringToUTF8([sender stringValue]));
++}
++
++- (void)newTab:(id)sender {
++  content::Shell* active = [self activeShell];
++  if (!active)
++    return;
++  // The "+ New Tab" button opens a blank tab and switches to it.
++  _foregroundNextTab = YES;
++  content::Shell::CreateNewWindow(active->web_contents()->GetBrowserContext(),
++                                  GURL("about:blank"), nullptr,
++                                  content::Shell::GetShellDefaultSize());
++}
++
++- (void)tabClicked:(id)sender {
++  for (TabInfo* tab in _tabs) {
++    if (tab->titleButton == sender) {
++      [self activateTab:tab];
++      if (tab->shell)
++        tab->shell->web_contents()->Focus();
++      return;
++    }
++  }
++}
++
++- (void)closeTabButton:(id)sender {
++  for (TabInfo* tab in _tabs) {
++    if (tab->closeButton == sender) {
++      content::Shell* shell = tab->shell;
++      // Close() deletes the Shell, which calls back into removeTabForShell:.
++      // Do not touch `sender` or `tab` after this point.
++      if (shell)
++        shell->Close();
++      return;
++    }
++  }
++}
++
++// --- NSWindowDelegate ------------------------------------------------------
++
++- (BOOL)windowShouldClose:(id)sender {
++  // Closing the window closes every tab. Close()->~Shell()->removeTabForShell:
++  // is suppressed by _closingAll so we can tear down deterministically here.
++  _closingAll = YES;
++  NSArray<TabInfo*>* snapshot = [_tabs copy];
++  for (TabInfo* tab in snapshot) {
++    content::Shell* shell = tab->shell;
++    tab->shell = nullptr;
++    if (shell)
++      shell->Close();  // -> delete Shell -> last one fires Shell::Shutdown().
++  }
++  [_tabs removeAllObjects];
++  _window.delegate = nil;
++  return YES;
++}
++
++@end
++
++namespace content {
++
++// These are required by the header (it declares the members), but the tab
++// controller above holds all real state, so they stay empty.
++struct ShellPlatformDelegate::ShellData {};
+ struct ShellPlatformDelegate::PlatformData {};
+ 
+ ShellPlatformDelegate::ShellPlatformDelegate() = default;
+@@ -132,194 +523,85 @@ void MakeShellButton(NSRect* rect,
+ void ShellPlatformDelegate::CreatePlatformWindow(
+     Shell* shell,
+     const gfx::Size& initial_size) {
+-  DCHECK(!shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  int width = initial_size.width();
+-  int height = initial_size.height();
+-
+-  if (!Shell::ShouldHideToolbar()) {
+-    height += kURLBarHeight;
+-  }
+-  NSRect initial_window_bounds = NSMakeRect(0, 0, width, height);
+-  NSRect content_rect = initial_window_bounds;
+-  NSUInteger style_mask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+-                          NSWindowStyleMaskMiniaturizable |
+-                          NSWindowStyleMaskResizable;
+-  NSWindow* window =
+-      [[NSWindow alloc] initWithContentRect:content_rect
+-                                  styleMask:style_mask
+-                                    backing:NSBackingStoreBuffered
+-                                      defer:NO];
+-  window.title = kWindowTitle;
+-  NSView* content = window.contentView;
+-
+-  // If the window is allowed to get too small, it will wreck the view bindings.
+-  NSSize min_size = NSMakeSize(kMinimumWindowWidth, kMinimumWindowHeight);
+-  min_size = [content convertSize:min_size toView:nil];
+-  // Note that this takes window coordinates.
+-  window.contentMinSize = min_size;
+-
+-  // Set the shell window to participate in fullscreen mode.
+-  window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+-
+-  // Rely on the window delegate to clean us up rather than immediately
+-  // releasing when the window gets closed. We use the delegate to do everything
+-  // from the autorelease pool so the shell isn't on the stack during cleanup
+-  // (ie, a window close from javascript). Also, releasedWhenClosed == YES is
+-  // incompatible with ARC.
+-  window.releasedWhenClosed = NO;
+-
+-  // Create a window delegate to watch for when it's asked to go away.
+-  ContentShellWindowDelegate* delegate =
+-      [[ContentShellWindowDelegate alloc] initWithShell:shell window:window];
+-
+-  if (!Shell::ShouldHideToolbar()) {
+-    NSRect button_frame =
+-        NSMakeRect(0, NSMaxY(initial_window_bounds) - kURLBarHeight,
+-                   kButtonWidth, kURLBarHeight);
+-
+-    MakeShellButton(&button_frame, @"Back", content, IDC_NAV_BACK, delegate,
+-                    @"[", NSEventModifierFlagCommand);
+-    MakeShellButton(&button_frame, @"Forward", content, IDC_NAV_FORWARD,
+-                    delegate, @"]", NSEventModifierFlagCommand);
+-    MakeShellButton(&button_frame, @"Reload", content, IDC_NAV_RELOAD, delegate,
+-                    @"r", NSEventModifierFlagCommand);
+-    MakeShellButton(&button_frame, @"Stop", content, IDC_NAV_STOP, delegate,
+-                    @".", NSEventModifierFlagCommand);
+-
+-    button_frame.size.width =
+-        NSWidth(initial_window_bounds) - NSMinX(button_frame);
+-    NSTextField* url_edit_view =
+-        [[NSTextField alloc] initWithFrame:button_frame];
+-    [content addSubview:url_edit_view];
+-    url_edit_view.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+-    url_edit_view.target = delegate;
+-    url_edit_view.action = @selector(takeURLStringValueFrom:);
+-    url_edit_view.cell.wraps = NO;
+-    url_edit_view.cell.scrollable = YES;
+-    shell_data.url_edit_view = url_edit_view;
++  if (!g_tab_controller) {
++    NSSize size = NSMakeSize(initial_size.width(), initial_size.height());
++    g_tab_controller =
++        [[TabbedShellController alloc] initWithContentSize:size];
+   }
+-
+-  // Show the new window.
+-  [window makeKeyAndOrderFront:nil];
+-
+-  shell_data.delegate = delegate;
++  [g_tab_controller addTabForShell:shell];
+ }
+ 
+ gfx::NativeWindow ShellPlatformDelegate::GetNativeWindow(Shell* shell) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  return gfx::NativeWindow(shell_data.delegate.window);
++  return gfx::NativeWindow(g_tab_controller.window);
+ }
+ 
+ void ShellPlatformDelegate::CleanUp(Shell* shell) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  shell_data_map_.erase(shell);
++  [g_tab_controller removeTabForShell:shell];
+ }
+ 
+ void ShellPlatformDelegate::SetContents(Shell* shell) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  NSView* web_view = shell->web_contents()->GetNativeView().GetNativeNSView();
+-  web_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+-
+-  NSWindow* window = shell_data.delegate.window;
+-  [window.contentView addSubview:web_view];
+-
+-  NSRect frame = window.contentView.bounds;
+-  if (!Shell::ShouldHideToolbar()) {
+-    frame.size.height -= kURLBarHeight;
+-  }
+-  web_view.frame = frame;
+-  web_view.needsDisplay = YES;
++  [g_tab_controller attachContentsForShell:shell];
+ }
+ 
+ void ShellPlatformDelegate::ResizeWebContent(Shell* shell,
+                                              const gfx::Size& content_size) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
++  // Resize the shared window's content area to fit the requested web size plus
++  // the sidebar and toolbar chrome.
+   int toolbar_height = Shell::ShouldHideToolbar() ? 0 : kURLBarHeight;
+-  NSRect frame = NSMakeRect(0, 0, content_size.width(),
+-                            content_size.height() + toolbar_height);
+-  shell_data.delegate.window.contentView.frame = frame;
++  NSSize new_size = NSMakeSize(content_size.width() + kSidebarWidth,
++                               content_size.height() + toolbar_height);
++  [g_tab_controller.window setContentSize:new_size];
+ }
+ 
+ void ShellPlatformDelegate::EnableUIControl(Shell* shell,
+                                             UIControl control,
+                                             bool is_enabled) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  int id;
++  int control_id;
+   switch (control) {
+     case BACK_BUTTON:
+-      id = IDC_NAV_BACK;
++      control_id = IDC_NAV_BACK;
+       break;
+     case FORWARD_BUTTON:
+-      id = IDC_NAV_FORWARD;
++      control_id = IDC_NAV_FORWARD;
+       break;
+     case STOP_BUTTON:
+-      id = IDC_NAV_STOP;
++      control_id = IDC_NAV_STOP;
+       break;
+     default:
+       NOTREACHED() << "Unknown UI control";
+   }
+-  [[shell_data.delegate.window.contentView viewWithTag:id]
+-      setEnabled:is_enabled];
++  [g_tab_controller setEnabled:is_enabled forControlId:control_id shell:shell];
+ }
+ 
+ void ShellPlatformDelegate::SetAddressBarURL(Shell* shell, const GURL& url) {
+-  if (Shell::ShouldHideToolbar()) {
+-    return;
+-  }
+-
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  NSString* url_string = base::SysUTF8ToNSString(url.spec());
+-  shell_data.url_edit_view.stringValue = url_string;
++  [g_tab_controller setURLString:base::SysUTF8ToNSString(url.spec())
++                        forShell:shell];
+ }
+ 
+ void ShellPlatformDelegate::SetIsLoading(Shell* shell, bool loading) {}
+ 
+ void ShellPlatformDelegate::SetTitle(Shell* shell,
+                                      const std::u16string& title) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  shell_data.delegate.window.title = base::SysUTF16ToNSString(title);
++  [g_tab_controller setTitleString:base::SysUTF16ToNSString(title)
++                          forShell:shell];
+ }
+ 
+ void ShellPlatformDelegate::MainFrameCreated(Shell* shell,
+                                              RenderFrameHost* main_frame) {}
+ 
+ bool ShellPlatformDelegate::DestroyShell(Shell* shell) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  [shell_data.delegate.window performClose:nil];
+-  return true;  // The performClose() will do the destruction of Shell.
++  // Let the Shell delete itself; CleanUp() (-> removeTabForShell:) does the UI
++  // teardown.
++  return false;
+ }
+ 
+ void ShellPlatformDelegate::ActivateContents(Shell* shell,
+                                              WebContents* top_contents) {
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+-
+-  // This focuses the main frame RenderWidgetHost in the window, but does not
+-  // make the window itself active. The WebContentsDelegate (this class) is
+-  // responsible for doing both.
++  TabInfo* tab = [g_tab_controller tabForShell:shell];
++  if (tab)
++    [g_tab_controller activateTab:tab];
+   top_contents->Focus();
+-  // This makes the window the active window for the application, and when the
+-  // app is active, the window will be also. That makes all RenderWidgetHosts
+-  // for the window active (which is separate from focused on mac).
+-  [shell_data.delegate.window makeKeyAndOrderFront:nil];
+-  // This makes the application active so that we can actually move focus
+-  // between windows and the renderer can receive focus/blur events.
++  [g_tab_controller.window makeKeyAndOrderFront:nil];
+   [NSApp activateIgnoringOtherApps:YES];
+ }
+ 
+@@ -331,23 +613,16 @@ void MakeShellButton(NSRect* rect,
+     Shell* shell,
+     WebContents* source,
+     const input::NativeWebKeyboardEvent& event) {
+-  if (event.skip_if_unhandled || Shell::ShouldHideToolbar()) {
++  if (event.skip_if_unhandled || Shell::ShouldHideToolbar())
+     return false;
+-  }
+-
+-  DCHECK(shell_data_map_.contains(shell));
+-  ShellData& shell_data = shell_data_map_[shell];
+ 
+-  // The event handling to get this strictly right is a tangle; cheat here a bit
+-  // by just letting the menus have a chance at it.
+   NSEvent* ns_event = event.os_event.Get();
+   if (ns_event.type == NSEventTypeKeyDown) {
+     if ((ns_event.modifierFlags & NSEventModifierFlagCommand) &&
+         [ns_event.characters isEqual:@"l"]) {
+-      [shell_data.delegate.window makeFirstResponder:shell_data.url_edit_view];
++      [g_tab_controller focusURLField];
+       return true;
+     }
+-
+     [NSApp.mainMenu performKeyEquivalent:ns_event];
+     return true;
+   }

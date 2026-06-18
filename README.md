@@ -60,6 +60,8 @@ Run it:
 - ✅ **Stage 1 — minimal browser builds & runs.** `content_shell` (Chromium's minimal
   Blink+V8 browser) compiles from our config and runs with the full multi-process,
   sandboxed, site-isolated architecture.
+- 🛠️ **Customizations** (as `patches/`): vertical tab strip on the left, with background
+  tabs (cmd+click) that flash the strip instead of stealing focus. See `patches/README.md`.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
