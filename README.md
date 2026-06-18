@@ -1,10 +1,8 @@
-# minichromium
+# mini_browser
 
 A personalized, minimal web browser built on the Chromium engine — a learning project in
 understanding how a real browser works by building and modifying one, **under deliberate
 hardware constraints** (an 8 GB Apple Silicon MacBook Air).
-
-> **Working name.** Rename freely to match the GitHub repo.
 
 ## What this is (and isn't)
 
@@ -35,8 +33,8 @@ What lives here:
 ## Quickstart
 
 ```sh
-git clone <this-repo>
-cd minichromium
+git clone https://github.com/astuka/mini_browser.git
+cd mini_browser
 ./setup.sh          # clones depot_tools, fetches pinned Chromium, links our code, runs gn gen
 ```
 

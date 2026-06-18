@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup.sh — reproducible setup for the minichromium overlay.
+# setup.sh — reproducible setup for the mini_browser overlay.
 #
 # What it does:
 #   1. Ensures depot_tools is available.

@@ -1,4 +1,4 @@
-# Building minichromium
+# Building mini_browser
 
 This documents the real build process for this project, **including the non-obvious gotchas
 we hit** building on an 8 GB Apple Silicon MacBook Air. If you're on a beefier machine, most
