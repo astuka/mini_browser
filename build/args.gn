@@ -1,0 +1,23 @@
+# Minimal content_shell build, tuned for an 8 GB Apple Silicon MacBook Air.
+# We build the //content/shell:content_shell target, NOT //chrome, so the entire
+# 1.3 GB Chrome feature layer (sync, profiles, settings UI, omnibox, NTP,
+# extensions, Safe Browsing, etc.) is never compiled.
+#
+# This first build keeps feature flags conservative on purpose: get a clean,
+# working shell first, then trim individual features incrementally (cheap, thanks
+# to fast component-build incremental rebuilds). See research.md §3/§5.
+
+# Release + component build: fast incremental rebuilds and low peak linker
+# memory (many small dylibs instead of one giant binary) — the key mitigation
+# for 8 GB RAM.
+is_debug = false
+is_component_build = true
+
+# Symbols: reduce aggressively to save RAM/disk. Blink is the bulk of the
+# codebase, so stripping its symbols specifically is a big win; the rest keeps
+# function-level backtraces.
+symbol_level = 1
+blink_symbol_level = 0
+
+# Native Apple Silicon.
+target_cpu = "arm64"

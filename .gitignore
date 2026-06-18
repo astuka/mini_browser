@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+*~
+
+# A Chromium checkout placed inside the repo is NEVER committed.
+# (setup.sh fetches it here by default; override with CHROMIUM_SRC.)
+/chromium/
+
+# Build outputs should never live in this repo, but guard against accidents.
+out/
+*.o
+*.a
+*.dylib
+*.so
