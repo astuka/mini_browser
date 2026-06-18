@@ -4,7 +4,16 @@ This directory holds changes we make to **upstream Chromium files**, stored as `
 rather than copies of the files themselves. This keeps the repo small, makes our changes
 reviewable in isolation, and keeps them cleanly separated from the engine.
 
-It is **empty for now** — we haven't modified any upstream files yet.
+## Current patches
+
+- **`0001-vertical-tabs-mac.patch`** — rewrites `content/shell/browser/shell_platform_delegate_mac.mm`
+  to give content_shell a **vertical tab strip on the left** of a single shared window
+  (content_shell normally opens one native window per page). Each `Shell`/`WebContents`
+  becomes a tab whose web view swaps into a shared content area, with the toolbar retargeting
+  to the active tab. Also: tabs opened in the background (cmd+click, middle-click,
+  `target=_blank`, `window.open`) appear at the bottom without stealing focus and trigger a
+  subtle accent flash across the whole strip; the `+ New Tab` button opens a foreground blank
+  tab. Contained entirely to that one file (no `Shell` core or header changes).
 
 ## Workflow
 
