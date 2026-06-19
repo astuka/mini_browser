@@ -69,17 +69,18 @@ Run it:
   to bookmark it; **renamable folders** (right-click or double-click a folder); and
   **session persistence** — your tabs and folders are restored automatically on
   the next launch (and after a crash). See `patches/README.md`.
-- 🛡️ **Security epic (in progress):** building browser-security primitives directly on
-  content_shell, from scratch (no `//chrome`). So far: a connection-security indicator
-  (lock / "Not Secure") derived ourselves from the navigation's TLS state; a certificate
-  viewer (subject / issuer / validity / SANs); a real certificate-error interstitial
-  ("Your connection is not private" with Back-to-safety / Proceed); HTTPS-First mode
-  (upgrades http→https, with a fallback interstitial when a site has no HTTPS); a
-  local URL blocklist (our own miniature "Safe Browsing" with a dangerous-site interstitial);
-  a from-scratch permission system (Allow/Block prompts for geolocation, notifications,
-  camera, mic, and clipboard, persisted per-origin); and per-site settings from the lock
-  popover (per-site JavaScript toggle + global third-party-cookie blocking); and
-  download safety (dangerous file-type warnings, with downloads saving to ~/Downloads).
+- 🛡️ **Security epic ("Fortify") — complete:** browser-security primitives built directly on
+  content_shell, from scratch (no `//chrome`). A connection-security indicator (lock / "Not
+  Secure") derived ourselves from the navigation's TLS state; a certificate viewer (subject /
+  issuer / validity / SANs); a real certificate-error interstitial ("Your connection is not
+  private" with Back-to-safety / Proceed); HTTPS-First mode (upgrades http→https, with a
+  fallback interstitial when a site has no HTTPS); a local URL blocklist (our own miniature
+  "Safe Browsing" with a dangerous-site interstitial); a from-scratch permission system
+  (Allow/Block prompts for geolocation, notifications, camera, mic, and clipboard, persisted
+  per-origin); per-site settings from the lock popover (per-site JavaScript toggle + global
+  third-party-cookie blocking); download safety (dangerous file-type warnings); and a
+  Security Diagnostics panel (⌘⇧D — process model, sandbox status, site isolation, per-tab
+  renderer PIDs).
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

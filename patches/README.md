@@ -177,6 +177,15 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (bridge decl), and `shell_platform_delegate_mac.mm` (sheet); stacks on the full prior chain.
   (Broader download support — a Save-As dialog, resumable downloads, a downloads UI — is out of
   scope for the security epic and can be added later.)
+- **`0019-security-process-diagnostics.patch`** — a **Security Diagnostics** panel (⌘⇧D), the final
+  security-epic feature: it makes content_shell's inherited multiprocess/sandbox/site-isolation
+  architecture *observable*. Reports the process model (`RenderProcessHost::run_renderer_in_process`),
+  renderer sandbox status (`--no-sandbox`), site-per-process and isolated-origins mode
+  (`content::SiteIsolationPolicy`), the count of distinct renderer processes, and a per-tab list of
+  renderer PIDs (`GetPrimaryMainFrame()->GetProcess()->GetProcess().Pid()`) — so cross-site tabs
+  visibly land in separate processes. Shown as an informational sheet; triggered via ⌘⇧D in
+  `HandleKeyboardEvent`. Touches `content/shell/browser/shell_platform_delegate_mac.mm` only; stacks
+  on the full prior chain. **This completes the "Fortify" security epic (`0011`–`0019`).**
 
 ## Workflow
 

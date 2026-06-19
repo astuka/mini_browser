@@ -1,0 +1,108 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 8501b1751d..8d5d0ab0e0 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -20,6 +20,7 @@
+ #include "base/check_op.h"
+ #include "base/command_line.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/process/process.h"
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -29,8 +30,10 @@
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/site_isolation_policy.h"
+ #include "content/public/browser/ssl_status.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+@@ -246,6 +249,7 @@ - (void)presentPermissionPromptForShell:(content::Shell*)shell
+                               onResolve:(void (^)(BOOL allow))resolve;
+ - (void)presentDownloadWarningForFilename:(NSString*)filename
+                                 onResolve:(void (^)(BOOL keep))resolve;
++- (void)showSecurityDiagnostics;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1583,6 +1587,62 @@ - (void)presentDownloadWarningForFilename:(NSString*)filename
+                 }];
+ }
+ 
++// --- Security diagnostics (S9) ----------------------------------------------
++
++// Reports the live process/sandbox/isolation posture — making the multiprocess,
++// sandboxed, site-isolated architecture content_shell inherits observable.
++- (NSString*)securityDiagnosticsText {
++  base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  BOOL noSandbox = cl->HasSwitch("no-sandbox");
++  BOOL singleProcess = content::RenderProcessHost::run_renderer_in_process();
++  BOOL sitePerProcess =
++      content::SiteIsolationPolicy::UseDedicatedProcessesForAllSites();
++  BOOL isolatedOrigins =
++      content::SiteIsolationPolicy::AreIsolatedOriginsEnabled();
++
++  NSMutableString* s = [NSMutableString string];
++  [s appendFormat:@"Process model: %@\n",
++                  singleProcess ? @"single process"
++                                : @"multi-process (renderer per site instance)"];
++  [s appendFormat:@"Renderer sandbox: %@\n",
++                  noSandbox ? @"DISABLED (--no-sandbox)" : @"enabled"];
++  [s appendFormat:@"Site isolation (site-per-process): %@\n",
++                  sitePerProcess ? @"on" : @"off"];
++  [s appendFormat:@"Isolated origins: %@\n", isolatedOrigins ? @"on" : @"off"];
++
++  NSMutableSet<NSNumber*>* pids = [NSMutableSet set];
++  NSMutableString* rows = [NSMutableString string];
++  for (TabNode* node in [self allNodes]) {
++    if (node->kind != TabNodeKindTab || !node->shell)
++      continue;
++    content::RenderProcessHost* rph =
++        node->shell->web_contents()->GetPrimaryMainFrame()->GetProcess();
++    base::ProcessId pid = rph->GetProcess().Pid();
++    [pids addObject:@(pid)];
++    NSString* title =
++        node->titleButton.title.length ? node->titleButton.title : @"(untitled)";
++    [rows appendFormat:@"  • %@ — renderer pid %d\n", title, (int)pid];
++  }
++  [s appendFormat:@"\nRenderer processes in use: %lu\n",
++                  (unsigned long)pids.count];
++  [s appendString:@"\nTabs:\n"];
++  [s appendString:rows];
++  return s;
++}
++
++// Shown via ⌘⇧D. An informational sheet listing the diagnostics.
++- (void)showSecurityDiagnostics {
++  if (!_window)
++    return;
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = @"Security Diagnostics";
++  alert.informativeText = [self securityDiagnosticsText];
++  [alert addButtonWithTitle:@"OK"];
++  [alert beginSheetModalForWindow:_window
++                completionHandler:^(NSModalResponse response){
++                }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2687,6 +2747,13 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+       [g_tab_controller focusURLField];
+       return true;
+     }
++    // ⌘⇧D → Security Diagnostics.
++    if ((ns_event.modifierFlags & NSEventModifierFlagCommand) &&
++        (ns_event.modifierFlags & NSEventModifierFlagShift) &&
++        [ns_event.charactersIgnoringModifiers.lowercaseString isEqual:@"d"]) {
++      [g_tab_controller showSecurityDiagnostics];
++      return true;
++    }
+     [NSApp.mainMenu performKeyEquivalent:ns_event];
+     return true;
+   }
