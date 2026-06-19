@@ -1,0 +1,133 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 836321fc34..a3e3857985 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -36,7 +36,10 @@
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "base/time/time.h"
+ #include "net/cert/cert_status_flags.h"
++#include "net/cert/x509_cert_types.h"
++#include "net/cert/x509_certificate.h"
+ #include "ui/gfx/native_ui_types.h"
+ #include "url/gurl.h"
+ 
+@@ -166,6 +169,7 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   NSButton* _reloadButton;
+   NSButton* _stopButton;
+   NSButton* _securityIndicator;          // Connection lock / "Not Secure" badge.
++  NSPopover* _certPopover;                // Cert/connection detail popover (S2).
+   NSTextField* _urlField;
+   NSView* _bookmarkBar;
+   NSButton* _addBookmarkButton;
+@@ -1064,8 +1068,108 @@ - (void)refreshSecurityIndicator {
+ 
+ // --- Actions ---------------------------------------------------------------
+ 
+-// Placeholder for S2 (certificate viewer); S1 only shows the indicator.
++// Click the indicator → toggle a popover summarizing the connection + (for
++// HTTPS) the server certificate, read straight from the navigation's SSLStatus.
+ - (void)securityIndicatorClicked:(id)sender {
++  if (_certPopover && _certPopover.shown) {
++    [_certPopover close];
++    return;
++  }
++
++  NSTextField* label =
++      [NSTextField wrappingLabelWithString:[self securityDetailText]];
++  label.selectable = YES;
++  label.preferredMaxLayoutWidth = 360;
++  [label sizeToFit];
++
++  NSRect lf = label.frame;
++  NSView* content = [[NSView alloc]
++      initWithFrame:NSMakeRect(0, 0, NSWidth(lf) + 24, NSHeight(lf) + 24)];
++  label.frame = NSMakeRect(12, 12, NSWidth(lf), NSHeight(lf));
++  [content addSubview:label];
++
++  NSViewController* vc = [[NSViewController alloc] init];
++  vc.view = content;
++  _certPopover = [[NSPopover alloc] init];
++  _certPopover.contentViewController = vc;
++  _certPopover.behavior = NSPopoverBehaviorTransient;
++  [_certPopover showRelativeToRect:_securityIndicator.bounds
++                            ofView:_securityIndicator
++                         preferredEdge:NSRectEdgeMaxY];
++}
++
++- (NSString*)formatCertTime:(base::Time)time {
++  base::Time::Exploded exploded;
++  time.UTCExplode(&exploded);
++  return [NSString stringWithFormat:@"%04d-%02d-%02d %02d:%02d UTC",
++                                    exploded.year, exploded.month,
++                                    exploded.day_of_month, exploded.hour,
++                                    exploded.minute];
++}
++
++// Builds the popover text: a one-line connection summary plus, for HTTPS, the
++// certificate's subject / organization / issuer / validity / SANs.
++- (NSString*)securityDetailText {
++  SecurityLevel level =
++      _activeTab ? _activeTab->securityLevel : SecurityLevelNone;
++  NSMutableString* s = [NSMutableString string];
++  switch (level) {
++    case SecurityLevelSecure:
++      [s appendString:@"Connection is secure (HTTPS)"];
++      break;
++    case SecurityLevelMixed:
++      [s appendString:@"HTTPS, but this page loaded insecure (mixed) content"];
++      break;
++    case SecurityLevelDangerous:
++      [s appendString:@"Certificate error — this connection is not private"];
++      break;
++    case SecurityLevelInsecure:
++      [s appendString:@"Not Secure — this site uses unencrypted HTTP"];
++      break;
++    case SecurityLevelNone:
++      return @"This is a local page (no network connection).";
++  }
++
++  content::Shell* shell = [self activeShell];
++  content::NavigationEntry* entry =
++      shell ? shell->web_contents()->GetController().GetVisibleEntry() : nullptr;
++  scoped_refptr<net::X509Certificate> cert =
++      entry ? entry->GetSSL().certificate : nullptr;
++  if (!cert) {
++    if (level == SecurityLevelInsecure)
++      [s appendString:@"\n\nNo certificate is presented over plain HTTP."];
++    return s;
++  }
++
++  const net::CertPrincipal& subject = cert->subject();
++  const net::CertPrincipal& issuer = cert->issuer();
++  [s appendString:@"\n"];
++  if (!subject.common_name.empty())
++    [s appendFormat:@"\nSubject: %@",
++                    base::SysUTF8ToNSString(subject.common_name)];
++  if (!subject.organization_names.empty())
++    [s appendFormat:@"\nOrganization: %@",
++                    base::SysUTF8ToNSString(subject.organization_names[0])];
++  std::string issuerName = !issuer.common_name.empty()
++                               ? issuer.common_name
++                               : (issuer.organization_names.empty()
++                                      ? std::string("(unknown)")
++                                      : issuer.organization_names[0]);
++  [s appendFormat:@"\nIssuer: %@", base::SysUTF8ToNSString(issuerName)];
++  [s appendFormat:@"\nValid from: %@", [self formatCertTime:cert->valid_start()]];
++  [s appendFormat:@"\nValid to:   %@",
++                  [self formatCertTime:cert->valid_expiry()]];
++
++  std::vector<std::string> dns_names;
++  std::vector<std::string> ip_addrs;
++  cert->GetSubjectAltName(&dns_names, &ip_addrs);
++  if (!dns_names.empty()) {
++    NSMutableArray<NSString*>* names = [NSMutableArray array];
++    for (const std::string& name : dns_names)
++      [names addObject:base::SysUTF8ToNSString(name)];
++    [s appendFormat:@"\nSAN: %@", [names componentsJoinedByString:@", "]];
++  }
++  return s;
+ }
+ 
+ - (void)navAction:(id)sender {
