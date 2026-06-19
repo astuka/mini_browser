@@ -1,0 +1,170 @@
+diff --git a/content/shell/browser/shell_download_manager_delegate.cc b/content/shell/browser/shell_download_manager_delegate.cc
+index b5069bac74..0510d4ddb4 100644
+--- a/content/shell/browser/shell_download_manager_delegate.cc
++++ b/content/shell/browser/shell_download_manager_delegate.cc
+@@ -42,6 +42,10 @@
+ #include "ui/aura/window_tree_host.h"
+ #endif
+ 
++#if BUILDFLAG(IS_MAC)
++#include "content/shell/browser/shell_platform_delegate.h"
++#endif
++
+ namespace content {
+ 
+ ShellDownloadManagerDelegate::ShellDownloadManagerDelegate()
+@@ -141,6 +145,42 @@ void ShellDownloadManagerDelegate::GenerateFilename(
+       FROM_HERE, base::BindOnce(std::move(callback), suggested_path));
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++namespace {
++
++// Executable / installer file types we warn about before saving.
++bool IsDangerousFileType(const base::FilePath& path) {
++  std::string ext = base::ToLowerASCII(path.FinalExtension());
++  static const char* const kDangerous[] = {
++      ".dmg", ".pkg", ".app", ".exe",     ".scr", ".bat", ".cmd",
++      ".com", ".msi", ".jar", ".command", ".sh",  ".dylib"};
++  for (const char* d : kDangerous) {
++    if (ext == d)
++      return true;
++  }
++  return false;
++}
++
++// Completes the download to |path| (an empty path cancels the download).
++void RunTargetCallback(download::DownloadTargetCallback callback,
++                       const base::FilePath& path) {
++  download::DownloadTargetInfo target_info;
++  target_info.target_path = path;
++  if (!path.empty())
++    target_info.intermediate_path =
++        path.AddExtension(FILE_PATH_LITERAL(".crdownload"));
++  std::move(callback).Run(std::move(target_info));
++}
++
++void OnDownloadWarningDecision(download::DownloadTargetCallback callback,
++                               base::FilePath path,
++                               bool keep) {
++  RunTargetCallback(std::move(callback), keep ? path : base::FilePath());
++}
++
++}  // namespace
++#endif  // BUILDFLAG(IS_MAC)
++
+ void ShellDownloadManagerDelegate::OnDownloadPathGenerated(
+     uint32_t download_id,
+     download::DownloadTargetCallback callback,
+@@ -157,7 +197,23 @@ void ShellDownloadManagerDelegate::OnDownloadPathGenerated(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  // content_shell has no Save dialog on Mac, so save to the default Downloads
++  // directory — but warn first if the file type is dangerous (download safety).
++  if (IsDangerousFileType(suggested_path)) {
++    download::DownloadItem* item = download_manager_->GetDownload(download_id);
++    WebContents* web_contents =
++        item ? DownloadItemUtils::GetWebContents(item) : nullptr;
++    ShellPlatformDelegate::RequestDownloadDecision(
++        web_contents, suggested_path.BaseName().AsUTF8Unsafe(),
++        base::BindOnce(&OnDownloadWarningDecision, std::move(callback),
++                       suggested_path));
++    return;
++  }
++  RunTargetCallback(std::move(callback), suggested_path);
++#else
+   ChooseDownloadPath(download_id, std::move(callback), suggested_path);
++#endif
+ }
+ 
+ void ShellDownloadManagerDelegate::ChooseDownloadPath(
+diff --git a/content/shell/browser/shell_platform_delegate.h b/content/shell/browser/shell_platform_delegate.h
+index c129c726e5..5431c2c481 100644
+--- a/content/shell/browser/shell_platform_delegate.h
++++ b/content/shell/browser/shell_platform_delegate.h
+@@ -175,6 +175,13 @@ class ShellPlatformDelegate {
+       WebContents* web_contents,
+       const std::string& message,
+       base::OnceCallback<void(bool)> callback);
++
++  // Shows a "dangerous download" warning for |filename| and runs |callback|
++  // with the user's choice (true = keep/save it, false = discard).
++  static void RequestDownloadDecision(
++      WebContents* web_contents,
++      const std::string& filename,
++      base::OnceCallback<void(bool)> callback);
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 0537fb72dc..8501b1751d 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -244,6 +244,8 @@ - (void)presentBlocklistForShell:(content::Shell*)shell
+ - (void)presentPermissionPromptForShell:(content::Shell*)shell
+                                 message:(NSString*)message
+                               onResolve:(void (^)(BOOL allow))resolve;
++- (void)presentDownloadWarningForFilename:(NSString*)filename
++                                onResolve:(void (^)(BOOL keep))resolve;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1557,6 +1559,30 @@ - (void)presentPermissionPromptForShell:(content::Shell*)shell
+                 }];
+ }
+ 
++// Dangerous-download warning: a critical sheet with Keep / Discard.
++- (void)presentDownloadWarningForFilename:(NSString*)filename
++                                onResolve:(void (^)(BOOL keep))resolve {
++  if (!_window) {
++    if (resolve)
++      resolve(NO);
++    return;
++  }
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.alertStyle = NSAlertStyleCritical;
++  alert.messageText = @"This file might be dangerous";
++  alert.informativeText = [NSString
++      stringWithFormat:@"\"%@\" is an executable or installer that could harm "
++                       @"your computer. Keep it anyway?",
++                       filename];
++  [alert addButtonWithTitle:@"Keep"];
++  [alert addButtonWithTitle:@"Discard"];
++  [alert beginSheetModalForWindow:_window
++                completionHandler:^(NSModalResponse response) {
++                  if (resolve)
++                    resolve(response == NSAlertFirstButtonReturn);
++                }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2628,6 +2654,25 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+                                           onResolve:resolve];
+ }
+ 
++// static
++void ShellPlatformDelegate::RequestDownloadDecision(
++    WebContents* web_contents,
++    const std::string& filename,
++    base::OnceCallback<void(bool)> callback) {
++  __block base::OnceCallback<void(bool)> cb = std::move(callback);
++  void (^resolve)(BOOL) = ^(BOOL keep) {
++    if (cb)
++      std::move(cb).Run(keep);
++  };
++  if (!g_tab_controller) {
++    resolve(NO);  // No UI — fail safe (discard).
++    return;
++  }
++  [g_tab_controller
++      presentDownloadWarningForFilename:base::SysUTF8ToNSString(filename)
++                              onResolve:resolve];
++}
++
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,
+     WebContents* source,
