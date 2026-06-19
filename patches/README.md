@@ -157,6 +157,15 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   permissions keep the previous allowlist behavior. Touches `shell_permission_manager.cc` (the logic),
   `shell_content_browser_client.{cc,h}` (store), `shell_platform_delegate.h` (bridge decl), and
   `shell_platform_delegate_mac.mm` (sheet); stacks on `0003`/`0010` and the full prior chain.
+- **`0017-security-site-content-settings.patch`** — **per-site content settings + cookie controls**,
+  surfaced as interactive checkboxes in the lock/"Not Secure" popover. **Enable JavaScript on this
+  site** writes a per-origin `javascript` flag into the `0016` SiteSettings store; `OverrideWebPreferences`
+  reads it and sets `prefs->javascript_enabled = false` (applied on the next reload, which the toggle
+  triggers). **Block third-party cookies (all sites)** drives the network service directly via
+  `StoragePartition::GetCookieManagerForBrowserProcess()->BlockThirdPartyCookies(...)`, persists a
+  global flag, and is re-applied at startup. Reuses the `0016` SiteSettings store. Touches
+  `shell_content_browser_client.{cc,h}` (JS pref read + store) and `shell_platform_delegate_mac.mm`
+  (popover checkboxes + cookie-manager call); stacks on `0016` and the full prior chain.
 
 ## Workflow
 

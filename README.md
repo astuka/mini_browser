@@ -76,8 +76,9 @@ Run it:
   ("Your connection is not private" with Back-to-safety / Proceed); HTTPS-First mode
   (upgrades http→https, with a fallback interstitial when a site has no HTTPS); a
   local URL blocklist (our own miniature "Safe Browsing" with a dangerous-site interstitial);
-  and a from-scratch permission system (Allow/Block prompts for geolocation, notifications,
-  camera, mic, and clipboard, persisted per-origin).
+  a from-scratch permission system (Allow/Block prompts for geolocation, notifications,
+  camera, mic, and clipboard, persisted per-origin); and per-site settings from the lock
+  popover (per-site JavaScript toggle + global third-party-cookie blocking).
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
