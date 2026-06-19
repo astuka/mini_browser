@@ -144,6 +144,19 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (throttle), `shell_platform_delegate.h` (bridge decl), and `shell_platform_delegate_mac.mm` (UI);
   stacks on `0013`/`0014` and the full prior chain. (This is the same request-interception groundwork
   the planned extensions ad-blocker will reuse.)
+- **`0016-security-permission-prompts.patch`** — a **permission system from scratch**, replacing
+  content_shell's auto-grant/deny test behavior. `ShellPermissionManager::RequestPermissionsFromCurrentDocument`
+  now resolves each promptable permission (**geolocation, notifications, camera, microphone,
+  clipboard**) using a saved per-origin decision, or — if undecided — a real **Allow / Block prompt**
+  (an `NSAlert` sheet), persisting the answer; `GetPermissionStatus` reflects the saved decision (or
+  `ASK`). Decisions live in a new persistent **per-origin SiteSettings store** —
+  `content_shell.site_settings` pref + `GetSitePermission`/`SetSitePermission` on
+  `ShellContentBrowserClient` (the foundational store the per-site content-settings PR will reuse).
+  A self-owned flow resolves multi-permission requests one prompt at a time; the prompt is bridged to
+  the Mac UI via a new static `ShellPlatformDelegate::RequestPermissionDecision`. Non-promptable
+  permissions keep the previous allowlist behavior. Touches `shell_permission_manager.cc` (the logic),
+  `shell_content_browser_client.{cc,h}` (store), `shell_platform_delegate.h` (bridge decl), and
+  `shell_platform_delegate_mac.mm` (sheet); stacks on `0003`/`0010` and the full prior chain.
 
 ## Workflow
 
