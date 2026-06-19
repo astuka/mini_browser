@@ -90,6 +90,18 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   prior `.mm` patch (`0001`/`0002`/`0004`/`0005`/`0006`/`0007`/`0008`/`0009`) and on `0003` for the
   `shell_content_browser_client.{cc,h}` store accessors.**
 
+### Security epic ("Fortify") — building browser security on content_shell from scratch
+
+- **`0011-security-connection-indicator.patch`** — a **connection-security indicator** in the
+  toolbar (first piece of the security epic). We derive the security level *ourselves* from the
+  navigation's URL scheme + `SSLStatus` (content_shell has no `//components/security_state`): a green
+  `lock.fill` for valid HTTPS, a grey "Not Secure" badge for HTTP, a yellow open-lock for HTTPS with
+  mixed content, a red warning for certificate errors, and nothing for internal pages (`data:`,
+  `about:`, …). Stored per-tab on `TabNode`, recomputed in `DidNavigatePrimaryMainFramePostCommit`
+  and re-shown on tab switch. The indicator is a (currently no-op) button so the upcoming certificate
+  viewer can hang off it. Touches `content/shell/browser/shell_platform_delegate_mac.mm`; stacks on
+  the full `.mm` chain (`0001`/`0002`/`0004`/`0005`/`0006`/`0007`/`0008`/`0009`/`0010`).
+
 ## Workflow
 
 `setup.sh` applies every `*.patch` here (in filename order) to the Chromium checkout with
