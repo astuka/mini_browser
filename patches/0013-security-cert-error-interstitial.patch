@@ -1,0 +1,367 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 120406b09e..55b01a4e35 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -29,6 +29,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/sequence_local_storage_slot.h"
+ #include "base/values.h"
++#include "base/functional/bind.h"
+ #include "build/build_config.h"
+ #include "cc/base/switches.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
+@@ -60,12 +61,14 @@
+ #include "content/public/browser/web_contents_view_delegate.h"
+ #include "content/public/common/content_features.h"
+ #include "content/public/common/content_switches.h"
++#include "content/public/browser/certificate_request_result_type.h"
+ #include "content/public/common/isolated_world_ids.h"
+ #include "content/public/common/url_constants.h"
+ #include "content/public/test/setup_field_trials.h"
+ #include "content/shell/browser/rust_test_service_ffi.rs.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_browser_context.h"
++#include "content/shell/browser/shell_platform_delegate.h"
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+@@ -706,6 +709,34 @@ std::unique_ptr<LoginDelegate> ShellContentBrowserClient::CreateLoginDelegate(
+   return nullptr;
+ }
+ 
++void ShellContentBrowserClient::AllowCertificateError(
++    WebContents* web_contents,
++    int cert_error,
++    const net::SSLInfo& ssl_info,
++    const GURL& request_url,
++    bool is_primary_main_frame_request,
++    bool strict_enforcement,
++    base::OnceCallback<void(CertificateRequestResultType)> callback) {
++#if BUILDFLAG(IS_MAC)
++  // For a top-level navigation, hand the decision to a real interstitial in the
++  // UI (Back to safety vs. Proceed). content_shell's default would just block.
++  if (is_primary_main_frame_request) {
++    auto on_decision = base::BindOnce(
++        [](base::OnceCallback<void(CertificateRequestResultType)> cb,
++           bool proceed) {
++          std::move(cb).Run(proceed ? CERTIFICATE_REQUEST_RESULT_TYPE_CONTINUE
++                                    : CERTIFICATE_REQUEST_RESULT_TYPE_CANCEL);
++        },
++        std::move(callback));
++    ShellPlatformDelegate::RequestCertificateErrorDecision(
++        web_contents, request_url, cert_error, std::move(on_decision));
++    return;
++  }
++#endif
++  // Subresource cert errors (and non-Mac builds): block.
++  std::move(callback).Run(CERTIFICATE_REQUEST_RESULT_TYPE_CANCEL);
++}
++
+ base::DictValue ShellContentBrowserClient::GetNetLogConstants() {
+   base::DictValue client_constants;
+   client_constants.Set("name", "content_shell");
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index 906c1a41ed..ee19fa9e73 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -124,6 +124,14 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+       bool first_auth_attempt,
+       GuestPageHolder* guest,
+       LoginDelegate::LoginAuthRequiredCallback auth_required_callback) override;
++  void AllowCertificateError(
++      WebContents* web_contents,
++      int cert_error,
++      const net::SSLInfo& ssl_info,
++      const GURL& request_url,
++      bool is_primary_main_frame_request,
++      bool strict_enforcement,
++      base::OnceCallback<void(CertificateRequestResultType)> callback) override;
+   base::DictValue GetNetLogConstants() override;
+   base::FilePath GetSandboxedStorageServiceDataDirectory() override;
+   base::FilePath GetFirstPartySetsDirectory() override;
+diff --git a/content/shell/browser/shell_platform_delegate.h b/content/shell/browser/shell_platform_delegate.h
+index dafb97d3f2..78d832586a 100644
+--- a/content/shell/browser/shell_platform_delegate.h
++++ b/content/shell/browser/shell_platform_delegate.h
+@@ -9,6 +9,7 @@
+ #include <string>
+ 
+ #include "base/containers/flat_map.h"
++#include "base/functional/callback.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/mojom/choosers/color_chooser.mojom-forward.h"
+@@ -142,6 +143,16 @@ class ShellPlatformDelegate {
+   virtual bool HandleKeyboardEvent(Shell* shell,
+                                    WebContents* source,
+                                    const input::NativeWebKeyboardEvent& event);
++
++  // Shows a certificate-error interstitial for the navigation in
++  // |web_contents| and runs |callback| with the user's choice (true =
++  // proceed despite the error, false = go back to safety). Static because the
++  // single shared tab controller owns the UI.
++  static void RequestCertificateErrorDecision(
++      WebContents* web_contents,
++      const GURL& url,
++      int cert_error,
++      base::OnceCallback<void(bool)> callback);
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index a3e3857985..0f867a43ca 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -149,12 +149,28 @@ @interface TabNode : NSObject {
+   NSButton* closeButton;
+   __weak TabNode* parent;         // nil = top level.
+   SecurityLevel securityLevel;    // Connection security of the current page.
++  NSView* interstitialView;       // Security interstitial overlay (nil = none).
++  NSArray* interstitialTargets;   // Retains the overlay buttons' block targets.
+ }
+ @end
+ 
+ @implementation TabNode
+ @end
+ 
++// A retained target that runs a block when its button is clicked. NSControl's
++// `target` is weak, so the interstitial keeps these alive via the owning tab.
++@interface BlockTarget : NSObject
++@property(copy) void (^block)(void);
++@end
++
++@implementation BlockTarget
++@synthesize block = _block;
++- (void)fire:(id)sender {
++  if (self.block)
++    self.block();
++}
++@end
++
+ // Owns the single shared browser window and the vertical tab strip. There is
+ // one instance for the whole process (stored in g_tab_controller), matching the
+ // single process-wide ShellPlatformDelegate.
+@@ -212,6 +228,10 @@ - (void)setEnabled:(BOOL)enabled
+        forControlId:(int)controlId
+               shell:(content::Shell*)shell;
+ - (void)updateSecurityStateForShell:(content::Shell*)shell;
++- (void)presentCertErrorForShell:(content::Shell*)shell
++                             url:(const GURL&)url
++                       certError:(int)certError
++                       onResolve:(void (^)(BOOL proceed))resolve;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -872,6 +892,7 @@ - (void)activateTab:(TabNode*)tab {
+   if (layoutChanged)
+     [self layoutTabRows];
+ 
++  [self updateInterstitialVisibility];
+   [self saveSession];
+ }
+ 
+@@ -889,6 +910,7 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   if (flatIndex == NSNotFound)
+     flatIndex = 0;
+ 
++  [self dismissInterstitialForTab:tab];
+   [tab->webView removeFromSuperview];
+   [tab->rowView removeFromSuperview];
+   tab->shell = nullptr;
+@@ -1172,6 +1194,166 @@ - (NSString*)securityDetailText {
+   return s;
+ }
+ 
++// --- Interstitials (S3) ----------------------------------------------------
++
++// Reusable interstitial: a full-content-area overlay with a centered card
++// (title, message, optional mono detail, and one or two buttons). The primary
++// button is the safe choice; the secondary (optional) is the risky one. Both
++// handlers run after the overlay is dismissed. Designed to be reused by later
++// security features (HTTPS-First, blocklist).
++- (void)presentInterstitialInTab:(TabNode*)tab
++                           title:(NSString*)title
++                         message:(NSString*)message
++                          detail:(NSString*)detail
++                     primaryText:(NSString*)primaryText
++                   secondaryText:(NSString*)secondaryText
++                       onPrimary:(void (^)(void))onPrimary
++                     onSecondary:(void (^)(void))onSecondary {
++  if (!tab)
++    return;
++  [self dismissInterstitialForTab:tab];
++
++  NSView* overlay = [[NSView alloc] initWithFrame:_contentContainer.bounds];
++  overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  overlay.wantsLayer = YES;
++  overlay.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
++
++  const CGFloat cardW = 480;
++  const CGFloat cardH = 240;
++  NSView* card = [[NSView alloc]
++      initWithFrame:NSMakeRect((NSWidth(overlay.bounds) - cardW) / 2,
++                               (NSHeight(overlay.bounds) - cardH) / 2, cardW,
++                               cardH)];
++  card.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin |
++                          NSViewMinYMargin | NSViewMaxYMargin;
++  [overlay addSubview:card];
++
++  NSTextField* titleLabel = [NSTextField labelWithString:title];
++  titleLabel.font = [NSFont boldSystemFontOfSize:22];
++  titleLabel.frame = NSMakeRect(0, cardH - 34, cardW, 28);
++  [card addSubview:titleLabel];
++
++  NSTextField* msgLabel = [NSTextField wrappingLabelWithString:message];
++  msgLabel.preferredMaxLayoutWidth = cardW;
++  NSSize msgSize = [msgLabel sizeThatFits:NSMakeSize(cardW, CGFLOAT_MAX)];
++  msgLabel.frame =
++      NSMakeRect(0, cardH - 48 - msgSize.height, cardW, msgSize.height);
++  [card addSubview:msgLabel];
++
++  if (detail.length) {
++    NSTextField* detailLabel = [NSTextField wrappingLabelWithString:detail];
++    detailLabel.textColor = NSColor.secondaryLabelColor;
++    detailLabel.font = [NSFont monospacedSystemFontOfSize:11
++                                                   weight:NSFontWeightRegular];
++    detailLabel.preferredMaxLayoutWidth = cardW;
++    NSSize detailSize =
++        [detailLabel sizeThatFits:NSMakeSize(cardW, CGFLOAT_MAX)];
++    detailLabel.frame = NSMakeRect(0, 52, cardW, detailSize.height);
++    [card addSubview:detailLabel];
++  }
++
++  NSMutableArray* targets = [NSMutableArray array];
++
++  __weak TabbedShellController* weakSelf = self;
++  BlockTarget* primaryTarget = [[BlockTarget alloc] init];
++  primaryTarget.block = ^{
++    [weakSelf dismissInterstitialForTab:tab];
++    if (onPrimary)
++      onPrimary();
++  };
++  NSButton* primaryButton = [NSButton buttonWithTitle:primaryText
++                                               target:primaryTarget
++                                               action:@selector(fire:)];
++  primaryButton.keyEquivalent = @"\r";  // Default button (Enter).
++  [primaryButton sizeToFit];
++  CGFloat pbW = std::max(NSWidth(primaryButton.frame), CGFloat{120});
++  primaryButton.frame = NSMakeRect(cardW - pbW, 8, pbW, 32);
++  [card addSubview:primaryButton];
++  [targets addObject:primaryTarget];
++
++  if (secondaryText.length) {
++    BlockTarget* secondaryTarget = [[BlockTarget alloc] init];
++    secondaryTarget.block = ^{
++      [weakSelf dismissInterstitialForTab:tab];
++      if (onSecondary)
++        onSecondary();
++    };
++    NSButton* secondaryButton = [NSButton buttonWithTitle:secondaryText
++                                                   target:secondaryTarget
++                                                   action:@selector(fire:)];
++    [secondaryButton sizeToFit];
++    CGFloat sbW = std::max(NSWidth(secondaryButton.frame), CGFloat{120});
++    secondaryButton.frame = NSMakeRect(0, 8, sbW, 32);
++    [card addSubview:secondaryButton];
++    [targets addObject:secondaryTarget];
++  }
++
++  tab->interstitialView = overlay;
++  tab->interstitialTargets = targets;
++  [_contentContainer addSubview:overlay];
++  [self updateInterstitialVisibility];
++}
++
++- (void)dismissInterstitialForTab:(TabNode*)tab {
++  if (!tab)
++    return;
++  [tab->interstitialView removeFromSuperview];
++  tab->interstitialView = nil;
++  tab->interstitialTargets = nil;
++}
++
++// Only the active tab's interstitial should be visible, and it must sit above
++// the (re-raised) web view.
++- (void)updateInterstitialVisibility {
++  for (TabNode* node in [self allNodes]) {
++    if (!node->interstitialView)
++      continue;
++    BOOL active = (node == _activeTab);
++    node->interstitialView.hidden = !active;
++    if (active)
++      [_contentContainer addSubview:node->interstitialView
++                         positioned:NSWindowAbove
++                         relativeTo:nil];
++  }
++}
++
++// Builds and shows the certificate-error interstitial; `resolve(YES)` proceeds,
++// `resolve(NO)` goes back to safety (cancels the navigation).
++- (void)presentCertErrorForShell:(content::Shell*)shell
++                             url:(const GURL&)url
++                       certError:(int)certError
++                       onResolve:(void (^)(BOOL proceed))resolve {
++  TabNode* tab = shell ? [self tabForShell:shell] : nil;
++  if (!tab) {
++    if (resolve)
++      resolve(NO);  // No UI to show it in — fail safe.
++    return;
++  }
++  NSString* host = base::SysUTF8ToNSString(url.host());
++  NSString* title = @"Your connection is not private";
++  NSString* message = [NSString
++      stringWithFormat:@"%@ presented a certificate that couldn't be verified. "
++                       @"Someone may be impersonating the site to steal your "
++                       @"information.",
++                       host.length ? host : @"This site"];
++  NSString* detail =
++      [NSString stringWithFormat:@"net certificate error code: %d", certError];
++  [self presentInterstitialInTab:tab
++                           title:title
++                         message:message
++                          detail:detail
++                     primaryText:@"Back to safety"
++                   secondaryText:@"Proceed anyway (unsafe)"
++                       onPrimary:^{
++                         if (resolve)
++                           resolve(NO);
++                       }
++                     onSecondary:^{
++                       if (resolve)
++                         resolve(YES);
++                     }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2150,6 +2332,29 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+   [g_tab_controller updateSecurityStateForShell:shell];
+ }
+ 
++// static
++void ShellPlatformDelegate::RequestCertificateErrorDecision(
++    WebContents* web_contents,
++    const GURL& url,
++    int cert_error,
++    base::OnceCallback<void(bool)> callback) {
++  // Wrap the move-only callback in a block so the AppKit UI can run it once.
++  __block base::OnceCallback<void(bool)> cb = std::move(callback);
++  void (^resolve)(BOOL) = ^(BOOL proceed) {
++    if (cb)
++      std::move(cb).Run(proceed);
++  };
++  Shell* shell = Shell::FromWebContents(web_contents);
++  if (!shell || !g_tab_controller) {
++    resolve(NO);  // Fail safe (block) if there's no UI to ask in.
++    return;
++  }
++  [g_tab_controller presentCertErrorForShell:shell
++                                         url:url
++                                   certError:cert_error
++                                   onResolve:resolve];
++}
++
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,
+     WebContents* source,
