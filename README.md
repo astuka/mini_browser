@@ -62,7 +62,8 @@ Run it:
   sandboxed, site-isolated architecture.
 - 🛠️ **Customizations** (as `patches/`): vertical tab strip on the left, with background
   tabs (cmd+click) that flash the strip instead of stealing focus; SF Symbol icons on the
-  Back/Forward/Reload/Stop buttons. See `patches/README.md`.
+  Back/Forward/Reload/Stop buttons; a horizontal bookmark bar (persisted via the browser's
+  PrefService). See `patches/README.md`.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
