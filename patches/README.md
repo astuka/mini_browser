@@ -14,11 +14,17 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `target=_blank`, `window.open`) appear at the bottom without stealing focus and trigger a
   subtle accent flash across the whole strip; the `+ New Tab` button opens a foreground blank
   tab. Contained entirely to that one file (no `Shell` core or header changes).
+- **`0002-nav-icons.patch`** — replaces the Back/Forward/Reload/Stop toolbar button *text*
+  with **SF Symbol icons** (`chevron.backward/forward`, `arrow.clockwise`, `xmark`), guarded by
+  `@available(macOS 11.0, *)` with a text fallback. Also touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`** (it edits
+  a method that `0001` introduced).
 
 ## Workflow
 
 `setup.sh` applies every `*.patch` here (in filename order) to the Chromium checkout with
-`git apply`.
+`git apply`. **Patches that touch the same upstream file stack** — each is a delta on top of the
+previous one (in numeric order), so they must be applied in sequence (which `setup.sh` does).
 
 ### Creating a patch
 

@@ -1,0 +1,49 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 5677df9a2b..72aec5879e 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -219,7 +219,7 @@ - (NSButton*)makeToolbarButton:(NSString*)title
+                            tag:(int)tag
+                            key:(NSString*)key {
+   NSButton* button = [[NSButton alloc] initWithFrame:frame];
+-  button.title = title;
++  button.title = title;  // Fallback text + accessibility label.
+   button.bezelStyle = NSBezelStyleSmallSquare;
+   button.autoresizingMask = NSViewMinYMargin | NSViewMaxXMargin;
+   button.target = self;
+@@ -227,6 +227,35 @@ - (NSButton*)makeToolbarButton:(NSString*)title
+   button.tag = tag;
+   button.keyEquivalent = key;
+   button.keyEquivalentModifierMask = NSEventModifierFlagCommand;
++
++  // Prefer an SF Symbol icon over plain text for the nav buttons (macOS 11+).
++  // Falls back to the text title if the symbol or API is unavailable.
++  if (@available(macOS 11.0, *)) {
++    NSString* symbol = nil;
++    switch (tag) {
++      case IDC_NAV_BACK:
++        symbol = @"chevron.backward";
++        break;
++      case IDC_NAV_FORWARD:
++        symbol = @"chevron.forward";
++        break;
++      case IDC_NAV_RELOAD:
++        symbol = @"arrow.clockwise";
++        break;
++      case IDC_NAV_STOP:
++        symbol = @"xmark";
++        break;
++    }
++    if (symbol) {
++      NSImage* icon = [NSImage imageWithSystemSymbolName:symbol
++                                accessibilityDescription:title];
++      if (icon) {
++        button.image = icon;
++        button.imagePosition = NSImageOnly;
++      }
++    }
++  }
++
+   [_window.contentView addSubview:button];
+   return button;
+ }
