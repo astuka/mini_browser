@@ -121,6 +121,17 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   Touches `shell_content_browser_client.{cc,h}` (override), `shell_platform_delegate.h` (static
   bridge decl), and `shell_platform_delegate_mac.mm` (UI). Stacks on the full `.mm` chain through
   `0012`, plus `0003`/`0010` for the `shell_content_browser_client.{cc,h}` edits.
+- **`0014-security-https-first.patch`** — **HTTPS-First mode**, built from scratch (no `//chrome`
+  HttpsUpgrades). A `NavigationThrottle` (added in `CreateThrottlesForNavigation`) upgrades top-level
+  `http://` navigations to `https://` (`WillStartRequest` cancels the http nav and re-navigates to
+  https; skips IP/localhost and a session allowlist). If the https attempt fails (`WillFailRequest`
+  for a connection/protocol error — cert errors are handled separately by `0013`), it reuses the
+  `0013` interstitial primitive to show **"This site doesn't support HTTPS"** with **Continue to
+  HTTP site** (allowlists the host for the session, then loads the original http URL) / **Back to
+  safety** (cancel). Bridged to the Mac UI via a new static
+  `ShellPlatformDelegate::RequestHttpFallbackDecision`. Touches `shell_content_browser_client.cc`
+  (throttle), `shell_platform_delegate.h` (bridge decl), and `shell_platform_delegate_mac.mm` (UI);
+  stacks on `0013` (interstitial primitive) and the full prior chain.
 
 ## Workflow
 
