@@ -78,6 +78,17 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   emits while the field is *becoming* first responder. Closes out the tab-structure epic. Touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
   `0005`/`0006`/`0007`/`0008`** (extends the `0007` context menu).
+- **`0010-session-persistence.patch`** — **tabs survive quit and crash**. The whole tab tree (tabs +
+  their URLs/titles, folder grouping, each folder's name + expanded state, and which tab was active)
+  is serialized to a `content_shell.session` JSON pref and re-read on launch. Adds
+  `GetSession()/SetSession()` on `ShellContentBrowserClient` (mirrors the `0003` bookmark store;
+  pref registered outside the `IS_IOS` guard) in `shell_content_browser_client.{cc,h}`, and the
+  serialize/restore + save-on-change logic in `shell_platform_delegate_mac.mm`. On the first window,
+  a one-shot deferred pass restores the saved tree and (on a bare launch) closes the default startup
+  placeholder; an explicitly launched URL is kept as an extra tab. Persist-on-change gives free
+  crash recovery; a clean quit deliberately does **not** clear the store. So it **stacks on every
+  prior `.mm` patch (`0001`/`0002`/`0004`/`0005`/`0006`/`0007`/`0008`/`0009`) and on `0003` for the
+  `shell_content_browser_client.{cc,h}` store accessors.**
 
 ## Workflow
 

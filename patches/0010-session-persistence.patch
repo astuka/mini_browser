@@ -1,0 +1,383 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 86697ca7cf..120406b09e 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -151,6 +151,10 @@ inline constexpr char kJITEnabled[] = "settings.javascript.jit";
+ // depending on the heavier //components/bookmarks.
+ inline constexpr char kBookmarks[] = "content_shell.bookmarks";
+ 
++// The last session's tab tree, persisted as a JSON dict in local state (see
++// GetSession / SetSession), so tabs and folders can be restored on launch.
++inline constexpr char kSession[] = "content_shell.session";
++
+ using PerformanceManagerRegistry =
+     performance_manager::PerformanceManagerRegistry;
+ 
+@@ -290,6 +294,7 @@ std::unique_ptr<PrefService> CreateLocalState() {
+   metrics::MetricsService::RegisterPrefs(pref_registry.get());
+   variations::VariationsService::RegisterPrefs(pref_registry.get());
+   pref_registry->RegisterDictionaryPref(kBookmarks);
++  pref_registry->RegisterDictionaryPref(kSession);
+ 
+ #if BUILDFLAG(IS_IOS)
+   pref_registry->RegisterBooleanPref(kJITEnabled, true);
+@@ -485,6 +490,15 @@ void ShellContentBrowserClient::SetBookmarks(base::DictValue bookmarks) {
+   GetSharedState().local_state->CommitPendingWrite();
+ }
+ 
++base::DictValue ShellContentBrowserClient::GetSession() {
++  return GetSharedState().local_state->GetDict(kSession).Clone();
++}
++
++void ShellContentBrowserClient::SetSession(base::DictValue session) {
++  GetSharedState().local_state->SetDict(kSession, std::move(session));
++  GetSharedState().local_state->CommitPendingWrite();
++}
++
+ device::GeolocationSystemPermissionManager*
+ ShellContentBrowserClient::GetGeolocationSystemPermissionManager() {
+ #if BUILDFLAG(IS_MAC)
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index 0130a5f56c..906c1a41ed 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -214,6 +214,12 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   base::DictValue GetBookmarks();
+   void SetBookmarks(base::DictValue bookmarks);
+ 
++  // Persistent saved-session store (the tab tree from the last run), backed by a
++  // JSON dict in local state. Returns a copy; SetSession replaces the stored
++  // dict and flushes to disk. Used by the browser UI to restore tabs on launch.
++  base::DictValue GetSession();
++  void SetSession(base::DictValue session);
++
+  protected:
+   // Call this if CreateBrowserMainParts() is overridden in a subclass.
+   void set_browser_main_parts(ShellBrowserMainParts* parts);
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 04cab9f527..15e460afcf 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -18,6 +18,7 @@
+ 
+ #import "base/apple/foundation_util.h"
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
+@@ -162,6 +163,12 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   TabNode* _renamingFolder;              // The folder whose name is being edited.
+   NSTextField* _renameField;             // Inline editor overlaid on its row.
+   BOOL _renameCancelled;                 // Esc pressed: discard, don't save.
++  BOOL _restoring;                        // Restoring the saved session: don't
++                                         // auto-activate/flash created tabs.
++  BOOL _suppressSave;                    // Hold off persisting the session until
++                                         // the initial restore has run, so the
++                                         // placeholder tab can't clobber it.
++  TabNode* _restoreActiveTab;            // Saved active tab, activated post-restore.
+   BOOL _closingAll;
+   BOOL _hideToolbar;
+   // When set, the next tab created is brought to the foreground (used by the
+@@ -183,6 +190,7 @@ - (void)setEnabled:(BOOL)enabled
+               shell:(content::Shell*)shell;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
++- (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+ - (void)rowClicked:(TabNode*)node modifiers:(NSEventModifierFlags)modifiers;
+ - (void)beginRenameFolder:(TabNode*)folder;
+ - (NSMenu*)contextMenuForNode:(TabNode*)node;
+@@ -214,6 +222,10 @@ - (instancetype)initWithContentSize:(NSSize)size {
+   _flatRows = [[NSMutableArray alloc] init];
+   _selection = [[NSMutableArray alloc] init];
+   _bookmarkURLs = [[NSMutableArray alloc] init];
++  // Don't persist the session until the initial restore pass has run; otherwise
++  // the placeholder startup tab would overwrite the saved session before we read
++  // it.
++  _suppressSave = YES;
+   _hideToolbar = content::Shell::ShouldHideToolbar();
+ 
+   CGFloat toolbarHeight = _hideToolbar ? 0 : kURLBarHeight;
+@@ -712,6 +724,13 @@ - (void)addTabForShell:(content::Shell*)shell {
+   [_tabs addObject:tab];
+   [self layoutTabRows];
+ 
++  if (_restoring) {
++    // Session restore controls placement and which tab ends up active; don't
++    // auto-activate or flash for each recreated tab.
++    _foregroundNextTab = NO;
++    return;
++  }
++
+   if (isFirst || _foregroundNextTab) {
+     [self activateTab:tab];
+   } else {
+@@ -721,6 +740,7 @@ - (void)addTabForShell:(content::Shell*)shell {
+     [self flashSidebar];
+   }
+   _foregroundNextTab = NO;
++  [self saveSession];
+ }
+ 
+ // Subtle one-shot color pulse across the ENTIRE tab strip background, used to
+@@ -768,12 +788,16 @@ - (void)activateTab:(TabNode*)tab {
+     return;
+ 
+   // Make sure the tab is reachable: expand any collapsed ancestor folders.
++  // (Skipped while restoring, so a saved collapsed folder stays collapsed even
++  // when the active tab lives inside it.)
+   BOOL layoutChanged = NO;
+-  for (TabNode* p = tab->parent; p; p = p->parent) {
+-    if (!p->expanded) {
+-      p->expanded = YES;
+-      [self updateFolderTitle:p];
+-      layoutChanged = YES;
++  if (!_restoring) {
++    for (TabNode* p = tab->parent; p; p = p->parent) {
++      if (!p->expanded) {
++        p->expanded = YES;
++        [self updateFolderTitle:p];
++        layoutChanged = YES;
++      }
+     }
+   }
+ 
+@@ -809,6 +833,8 @@ - (void)activateTab:(TabNode*)tab {
+ 
+   if (layoutChanged)
+     [self layoutTabRows];
++
++  [self saveSession];
+ }
+ 
+ - (void)removeTabForShell:(content::Shell*)shell {
+@@ -847,9 +873,13 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   if ([self tabNodeCount] == 0) {
+     // The last tab closed; tear down the window. The Shell teardown that called
+     // us will fire DidCloseLastWindow() -> Shell::Shutdown() to quit the app.
++    // Don't save here — closing the last tab is a quit, and we want the last
++    // good session to survive for next launch.
+     _window.delegate = nil;
+     [_window close];
+     _window = nil;
++  } else {
++    [self saveSession];
+   }
+ }
+ 
+@@ -880,6 +910,9 @@ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell {
+   tab->titleButton.title = s.length ? s : @"Untitled";
+   if (tab == _activeTab)
+     _window.title = s.length ? s : kWindowTitle;
++  // A title change follows a navigation commit, so the tab's URL/title are now
++  // current — a good moment to persist the session.
++  [self saveSession];
+ }
+ 
+ - (void)setEnabled:(BOOL)enabled
+@@ -941,6 +974,7 @@ - (void)rowClicked:(TabNode*)node modifiers:(NSEventModifierFlags)modifiers {
+     node->expanded = !node->expanded;
+     [self updateFolderTitle:node];
+     [self layoutTabRows];
++    [self saveSession];
+     return;
+   }
+ 
+@@ -1192,6 +1226,7 @@ - (void)moveTabs:(NSArray<TabNode*>*)tabs intoFolder:(TabNode*)folder {
+   for (TabNode* op in oldParents)
+     [self pruneFolder:op];
+   [self layoutTabRows];
++  [self saveSession];
+ }
+ 
+ - (void)addSelectionToBookmarksFromMenu:(id)sender {
+@@ -1310,6 +1345,7 @@ - (void)controlTextDidEndEditing:(NSNotification*)notification {
+     folder->folderTitle = name.length ? name : @"Folder";
+     [self updateFolderTitle:folder];
+     [self layoutTabRows];
++    [self saveSession];
+   }
+ }
+ 
+@@ -1425,6 +1461,7 @@ - (BOOL)performDropOnNode:(TabNode*)target {
+     [self pruneFolder:oldParent];
+   [self updateFolderTitle:folder];
+   [self layoutTabRows];
++  [self saveSession];
+   return YES;
+ }
+ 
+@@ -1485,6 +1522,146 @@ - (BOOL)performBookmarkBarDrop {
+   return YES;
+ }
+ 
++// --- Session persistence ---------------------------------------------------
++
++// Serializes the tab tree to the saved-session pref. No-op while restoring or
++// during the startup window (see _suppressSave) and during a full window close
++// (we want the last good session to survive a quit, not be cleared).
++- (void)saveSession {
++  if (_suppressSave || _restoring || _closingAll)
++    return;
++  base::DictValue session;
++  session.Set("version", 1);
++  session.Set("roots", [self serializeNodes:_tabs]);
++  content::ShellContentBrowserClient::Get()->SetSession(std::move(session));
++}
++
++- (base::ListValue)serializeNodes:(NSArray<TabNode*>*)nodes {
++  base::ListValue list;
++  for (TabNode* node in nodes) {
++    base::DictValue dict;
++    if (node->kind == TabNodeKindFolder) {
++      dict.Set("type", "folder");
++      dict.Set("title", base::SysNSStringToUTF8(
++                            node->folderTitle.length ? node->folderTitle
++                                                     : @"Folder"));
++      dict.Set("expanded", static_cast<bool>(node->expanded));
++      dict.Set("children", [self serializeNodes:node->children]);
++    } else {
++      dict.Set("type", "tab");
++      std::string url;
++      std::string title;
++      if (node->shell) {
++        url = node->shell->web_contents()->GetLastCommittedURL().spec();
++        title = base::UTF16ToUTF8(node->shell->web_contents()->GetTitle());
++      }
++      dict.Set("url", url);
++      dict.Set("title", title);
++      if (node == _activeTab)
++        dict.Set("active", true);
++    }
++    list.Append(std::move(dict));
++  }
++  return list;
++}
++
++// Recreates the saved tree under `parent` (nil = top level). Tabs become real
++// Shells (which append themselves at top level via addTabForShell), then get
++// re-parented into their folder.
++- (void)restoreNodes:(const base::ListValue&)nodes
++          intoFolder:(TabNode*)parent
++             context:(content::BrowserContext*)context {
++  for (const base::Value& item : nodes) {
++    const base::DictValue* dict = item.GetIfDict();
++    if (!dict)
++      continue;
++    const std::string* type = dict->FindString("type");
++    if (!type)
++      continue;
++
++    if (*type == "folder") {
++      TabNode* folder = [self makeFolderNode];
++      const std::string* title = dict->FindString("title");
++      if (title && !title->empty())
++        folder->folderTitle = base::SysUTF8ToNSString(*title);
++      folder->expanded = dict->FindBool("expanded").value_or(true);
++      if (parent) {
++        folder->parent = parent;
++        [parent->children addObject:folder];
++      } else {
++        [_tabs addObject:folder];
++      }
++      [_sidebar addSubview:folder->rowView];
++      if (const base::ListValue* children = dict->FindList("children"))
++        [self restoreNodes:*children intoFolder:folder context:context];
++      [self updateFolderTitle:folder];  // After children, so the count is right.
++    } else {
++      const std::string* url = dict->FindString("url");
++      std::string spec = (url && !url->empty()) ? *url : "about:blank";
++      content::Shell* shell = content::Shell::CreateNewWindow(
++          context, GURL(spec), nullptr, content::Shell::GetShellDefaultSize());
++      TabNode* node = [self tabForShell:shell];
++      if (!node)
++        continue;
++      if (parent) {
++        [self detachNode:node];  // Move out of the top-level roots.
++        node->parent = parent;
++        [parent->children addObject:node];
++      }
++      if (dict->FindBool("active").value_or(false))
++        _restoreActiveTab = node;
++    }
++  }
++}
++
++// Runs once, shortly after the first (placeholder) window comes up. Rebuilds the
++// previous session's tabs/folders, then disposes of the placeholder unless the
++// user explicitly launched with a URL.
++- (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder {
++  base::DictValue session =
++      content::ShellContentBrowserClient::Get()->GetSession();
++  const base::ListValue* roots = session.FindList("roots");
++
++  if (roots && !roots->empty() && placeholder &&
++      placeholder->web_contents()) {
++    content::BrowserContext* context =
++        placeholder->web_contents()->GetBrowserContext();
++    _restoreActiveTab = nil;
++    _restoring = YES;
++    [self restoreNodes:*roots intoFolder:nil context:context];
++
++    TabNode* toActivate = _restoreActiveTab;
++    _restoreActiveTab = nil;
++    if (!toActivate) {
++      [self rebuildFlatRows];
++      for (TabNode* node in _flatRows) {
++        if (node->kind == TabNodeKindTab) {
++          toActivate = node;
++          break;
++        }
++      }
++    }
++    if (toActivate)
++      [self activateTab:toActivate];
++
++    // The placeholder is the default startup page unless a URL was given on the
++    // command line; in the default case, drop it so only the restored tabs show.
++    BOOL launchedWithURL =
++        !base::CommandLine::ForCurrentProcess()->GetArgs().empty();
++    if (!launchedWithURL) {
++      TabNode* placeholderNode = [self tabForShell:placeholder];
++      if (placeholderNode && placeholderNode->shell)
++        placeholderNode->shell->Close();  // -> removeTabForShell:
++    }
++    _restoring = NO;
++    [self layoutTabRows];
++  }
++
++  // Begin persisting from here on, capturing the now-current state.
++  _suppressSave = NO;
++  [self saveSession];
++}
++
+ // --- NSWindowDelegate ------------------------------------------------------
+ 
+ - (BOOL)windowShouldClose:(id)sender {
+@@ -1641,12 +1818,25 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+ void ShellPlatformDelegate::CreatePlatformWindow(
+     Shell* shell,
+     const gfx::Size& initial_size) {
+-  if (!g_tab_controller) {
++  BOOL firstWindow = (g_tab_controller == nil);
++  if (firstWindow) {
+     NSSize size = NSMakeSize(initial_size.width(), initial_size.height());
+     g_tab_controller =
+         [[TabbedShellController alloc] initWithContentSize:size];
+   }
+   [g_tab_controller addTabForShell:shell];
++
++  if (firstWindow) {
++    // The first window is the startup placeholder. Once it's up, restore the
++    // previous session's tabs/folders (and dispose of the placeholder unless a
++    // URL was launched explicitly). Deferred to the next run-loop turn so it
++    // runs after startup finishes; creating the restored Shells re-enters here,
++    // but g_tab_controller already exists so only addTabForShell runs.
++    TabbedShellController* controller = g_tab_controller;
++    dispatch_async(dispatch_get_main_queue(), ^{
++      [controller restoreSessionWithPlaceholder:shell];
++    });
++  }
+ }
+ 
+ gfx::NativeWindow ShellPlatformDelegate::GetNativeWindow(Shell* shell) {
