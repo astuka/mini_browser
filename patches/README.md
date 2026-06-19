@@ -166,6 +166,17 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   global flag, and is re-applied at startup. Reuses the `0016` SiteSettings store. Touches
   `shell_content_browser_client.{cc,h}` (JS pref read + store) and `shell_platform_delegate_mac.mm`
   (popover checkboxes + cookie-manager call); stacks on `0016` and the full prior chain.
+- **`0018-security-download-safety.patch`** — **download safety**, plus working Mac downloads.
+  content_shell's `ChooseDownloadPath` is `NOTIMPLEMENTED()` on Mac (downloads silently fail), so
+  `ShellDownloadManagerDelegate::OnDownloadPathGenerated` now auto-saves to the default Downloads
+  directory — **but first warns if the file type is dangerous** (`.dmg`/`.pkg`/`.app`/`.exe`/`.msi`/
+  `.jar`/`.sh`/…). The warning is a critical sheet with **Keep** (save) / **Discard** (cancel),
+  bridged via a new static `ShellPlatformDelegate::RequestDownloadDecision`; Keep/safe both finish
+  the download via the same target callback, Discard cancels with an empty target path. Touches
+  `shell_download_manager_delegate.cc` (Mac save + dangerous-type check), `shell_platform_delegate.h`
+  (bridge decl), and `shell_platform_delegate_mac.mm` (sheet); stacks on the full prior chain.
+  (Broader download support — a Save-As dialog, resumable downloads, a downloads UI — is out of
+  scope for the security epic and can be added later.)
 
 ## Workflow
 
