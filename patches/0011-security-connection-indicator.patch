@@ -1,0 +1,213 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 15e460afcf..836321fc34 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -26,13 +26,17 @@
+ #include "base/values.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/ssl_status.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "net/cert/cert_status_flags.h"
+ #include "ui/gfx/native_ui_types.h"
+ #include "url/gurl.h"
+ 
+@@ -47,6 +51,8 @@
+ const CGFloat kSidebarWidth = 180;
+ const CGFloat kTabRowHeight = 30;
+ const CGFloat kCloseButtonWidth = 24;
++// Width of the connection-security indicator at the left of the URL field.
++const CGFloat kSecurityIndicatorWidth = 28;
+ // Horizontal indent per tree level, so a folder's tabs sit under the folder.
+ const CGFloat kIndent = 16;
+ // Minimum cursor travel (points) before a press on a tab row becomes a drag
+@@ -113,6 +119,17 @@ typedef NS_ENUM(NSInteger, TabNodeKind) {
+   TabNodeKindFolder = 1,
+ };
+ 
++// Connection-security level for a tab, derived ourselves from the navigation's
++// URL scheme + SSLStatus (content_shell has no //components/security_state, so
++// we compute this from the raw signals — that's the point of building it).
++typedef NS_ENUM(NSInteger, SecurityLevel) {
++  SecurityLevelNone = 0,   // Internal/local pages (about:, data:, file:, etc.).
++  SecurityLevelInsecure,   // Plain http — "Not Secure".
++  SecurityLevelSecure,     // https with a valid certificate.
++  SecurityLevelMixed,      // https page that also loaded insecure subresources.
++  SecurityLevelDangerous,  // https with a certificate error.
++};
++
+ @interface TabNode : NSObject {
+  @public
+   TabNodeKind kind;               // Tab vs. folder.
+@@ -128,6 +145,7 @@ @interface TabNode : NSObject {
+   NSButton* titleButton;
+   NSButton* closeButton;
+   __weak TabNode* parent;         // nil = top level.
++  SecurityLevel securityLevel;    // Connection security of the current page.
+ }
+ @end
+ 
+@@ -147,6 +165,7 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   NSButton* _forwardButton;
+   NSButton* _reloadButton;
+   NSButton* _stopButton;
++  NSButton* _securityIndicator;          // Connection lock / "Not Secure" badge.
+   NSTextField* _urlField;
+   NSView* _bookmarkBar;
+   NSButton* _addBookmarkButton;
+@@ -188,6 +207,7 @@ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setEnabled:(BOOL)enabled
+        forControlId:(int)controlId
+               shell:(content::Shell*)shell;
++- (void)updateSecurityStateForShell:(content::Shell*)shell;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -303,6 +323,19 @@ - (instancetype)initWithContentSize:(NSSize)size {
+                                       key:@"."];
+     r.origin.x += kButtonWidth;
+ 
++    // Connection-security indicator, just left of the URL field.
++    _securityIndicator = [[NSButton alloc]
++        initWithFrame:NSMakeRect(NSMinX(r), NSMinY(r), kSecurityIndicatorWidth,
++                                 kURLBarHeight)];
++    _securityIndicator.bezelStyle = NSBezelStyleSmallSquare;
++    _securityIndicator.bordered = NO;
++    _securityIndicator.imagePosition = NSImageOnly;
++    _securityIndicator.autoresizingMask = NSViewMinYMargin | NSViewMaxXMargin;
++    _securityIndicator.target = self;
++    _securityIndicator.action = @selector(securityIndicatorClicked:);
++    [content addSubview:_securityIndicator];
++    r.origin.x += kSecurityIndicatorWidth;
++
+     r.size.width = contentW - NSMinX(r);
+     _urlField = [[NSTextField alloc] initWithFrame:r];
+     _urlField.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+@@ -829,6 +862,7 @@ - (void)activateTab:(TabNode*)tab {
+     _urlField.stringValue = base::SysUTF8ToNSString(url.spec());
+     _window.title = tab->titleButton.title.length ? tab->titleButton.title
+                                                   : kWindowTitle;
++    [self refreshSecurityIndicator];
+   }
+ 
+   if (layoutChanged)
+@@ -940,8 +974,100 @@ - (void)focusURLField {
+     [_window makeFirstResponder:_urlField];
+ }
+ 
++// --- Connection security (S1) ----------------------------------------------
++
++// Derives the security level for a tab from its current navigation. We compute
++// this ourselves from the URL scheme + SSLStatus, because content_shell has no
++// //components/security_state to hand us a precomputed level.
++- (SecurityLevel)securityLevelForShell:(content::Shell*)shell {
++  if (!shell || !shell->web_contents())
++    return SecurityLevelNone;
++  content::NavigationEntry* entry =
++      shell->web_contents()->GetController().GetVisibleEntry();
++  if (!entry)
++    return SecurityLevelNone;
++  const GURL& url = entry->GetURL();
++  if (url.SchemeIsCryptographic()) {  // https / wss
++    const content::SSLStatus& ssl = entry->GetSSL();
++    if (net::IsCertStatusError(ssl.cert_status))
++      return SecurityLevelDangerous;
++    if (ssl.content_status & (content::SSLStatus::DISPLAYED_INSECURE_CONTENT |
++                             content::SSLStatus::RAN_INSECURE_CONTENT))
++      return SecurityLevelMixed;
++    return SecurityLevelSecure;
++  }
++  if (url.SchemeIs("http"))
++    return SecurityLevelInsecure;
++  return SecurityLevelNone;  // about:, data:, file:, chrome-extension:, …
++}
++
++// Recomputes a tab's stored security level; refreshes the indicator if it's the
++// active tab.
++- (void)updateSecurityStateForShell:(content::Shell*)shell {
++  TabNode* tab = [self tabForShell:shell];
++  if (!tab)
++    return;
++  tab->securityLevel = [self securityLevelForShell:shell];
++  if (tab == _activeTab)
++    [self refreshSecurityIndicator];
++}
++
++// Paints the indicator from the active tab's level (icon + tint + tooltip).
++- (void)refreshSecurityIndicator {
++  if (_hideToolbar || !_securityIndicator)
++    return;
++  SecurityLevel level = _activeTab ? _activeTab->securityLevel : SecurityLevelNone;
++
++  NSString* symbol = nil;
++  NSColor* tint = nil;
++  NSString* tip = nil;
++  switch (level) {
++    case SecurityLevelSecure:
++      symbol = @"lock.fill";
++      tint = NSColor.systemGreenColor;
++      tip = @"Connection is secure (HTTPS)";
++      break;
++    case SecurityLevelMixed:
++      symbol = @"lock.open.fill";
++      tint = NSColor.systemYellowColor;
++      tip = @"HTTPS page with insecure content";
++      break;
++    case SecurityLevelDangerous:
++      symbol = @"exclamationmark.triangle.fill";
++      tint = NSColor.systemRedColor;
++      tip = @"Certificate error — connection is not private";
++      break;
++    case SecurityLevelInsecure:
++      symbol = @"exclamationmark.circle";
++      tint = NSColor.secondaryLabelColor;
++      tip = @"Not Secure (HTTP)";
++      break;
++    case SecurityLevelNone:
++      break;  // No indicator for internal/local pages.
++  }
++
++  if (!symbol) {
++    _securityIndicator.image = nil;
++    _securityIndicator.hidden = YES;
++    _securityIndicator.toolTip = nil;
++    return;
++  }
++  _securityIndicator.hidden = NO;
++  _securityIndicator.toolTip = tip;
++  if (@available(macOS 11.0, *)) {
++    NSImage* icon = [NSImage imageWithSystemSymbolName:symbol
++                              accessibilityDescription:tip];
++    _securityIndicator.image = icon;
++    _securityIndicator.contentTintColor = tint;
++  }
++}
++
+ // --- Actions ---------------------------------------------------------------
+ 
++// Placeholder for S2 (certificate viewer); S1 only shows the indicator.
++- (void)securityIndicatorClicked:(id)sender {
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -1916,7 +2042,9 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+ 
+ void ShellPlatformDelegate::DidNavigatePrimaryMainFramePostCommit(
+     Shell* shell,
+-    WebContents* contents) {}
++    WebContents* contents) {
++  [g_tab_controller updateSecurityStateForShell:shell];
++}
+ 
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,

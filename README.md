@@ -69,6 +69,9 @@ Run it:
   to bookmark it; **renamable folders** (right-click or double-click a folder); and
   **session persistence** — your tabs and folders are restored automatically on
   the next launch (and after a crash). See `patches/README.md`.
+- 🛡️ **Security epic (in progress):** building browser-security primitives directly on
+  content_shell, from scratch (no `//chrome`). First up: a connection-security indicator
+  (lock / "Not Secure") derived ourselves from the navigation's TLS state.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
