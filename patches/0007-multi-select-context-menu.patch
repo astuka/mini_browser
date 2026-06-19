@@ -1,0 +1,424 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index a2971e2c8f..8d444fc62d 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -144,6 +144,9 @@ @interface TabbedShellController : NSObject <NSWindowDelegate> {
+   NSMutableArray<TabNode*>* _tabs;       // Top-level nodes (roots of the tree).
+   NSMutableArray<TabNode*>* _flatRows;   // Derived render order (DFS of _tabs).
+   TabNode* _activeTab;
++  NSMutableArray<TabNode*>* _selection;  // Multi-selected tabs (order = click
++                                         // order); independent of _activeTab.
++  __weak TabNode* _selectionAnchor;      // Pivot for shift-click range select.
+   __weak TabNode* _draggingNode;         // The row currently being dragged.
+   __weak TabNode* _dropTargetNode;       // The row currently highlighted as a
+                                          // drop target.
+@@ -168,7 +171,8 @@ - (void)setEnabled:(BOOL)enabled
+               shell:(content::Shell*)shell;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+-- (void)rowClicked:(TabNode*)node;
++- (void)rowClicked:(TabNode*)node modifiers:(NSEventModifierFlags)modifiers;
++- (NSMenu*)contextMenuForNode:(TabNode*)node;
+ - (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event;
+ - (NSDragOperation)dragOverNode:(TabNode*)target;
+ - (void)dragExitedNode:(TabNode*)target;
+@@ -191,6 +195,7 @@ - (instancetype)initWithContentSize:(NSSize)size {
+ 
+   _tabs = [[NSMutableArray alloc] init];
+   _flatRows = [[NSMutableArray alloc] init];
++  _selection = [[NSMutableArray alloc] init];
+   _bookmarkURLs = [[NSMutableArray alloc] init];
+   _hideToolbar = content::Shell::ShouldHideToolbar();
+ 
+@@ -594,8 +599,7 @@ - (void)updateFolderTitle:(TabNode*)folder {
+ }
+ 
+ // Single place that decides a row's background: drop-target highlight wins, then
+-// the active-tab highlight, else transparent. (A future multi-select state will
+-// slot in here too.)
++// the active-tab highlight, then the multi-select highlight, else transparent.
+ - (void)restyleRow:(TabNode*)node {
+   if (!node->rowView.wantsLayer)
+     return;
+@@ -604,11 +608,18 @@ - (void)restyleRow:(TabNode*)node {
+     color = [NSColor.controlAccentColor colorWithAlphaComponent:0.5];
+   else if (node == _activeTab)
+     color = NSColor.selectedControlColor;
++  else if ([_selection containsObject:node])
++    color = [NSColor.controlAccentColor colorWithAlphaComponent:0.30];
+   else
+     color = NSColor.clearColor;
+   node->rowView.layer.backgroundColor = color.CGColor;
+ }
+ 
++- (void)restyleAllRows {
++  for (TabNode* node in [self allNodes])
++    [self restyleRow:node];
++}
++
+ - (TabNode*)tabForShell:(content::Shell*)shell {
+   return [self findShell:shell in:_tabs];
+ }
+@@ -752,8 +763,11 @@ - (void)activateTab:(TabNode*)tab {
+   }
+ 
+   _activeTab = tab;
+-  if (prev)
+-    [self restyleRow:prev];
++  // Activating a tab outside of multi-select collapses the selection onto it
++  // (the ⌘/Shift-click paths don't go through activateTab, so they're unaffected).
++  [_selection removeAllObjects];
++  [_selection addObject:tab];
++  _selectionAnchor = tab;
+ 
+   tab->webView.hidden = NO;
+   [tab->webView.superview addSubview:tab->webView
+@@ -761,7 +775,7 @@ - (void)activateTab:(TabNode*)tab {
+                           relativeTo:nil];
+   if (tab->shell)
+     tab->shell->web_contents()->WasShown();
+-  [self restyleRow:tab];
++  [self restyleAllRows];
+ 
+   // Retarget the toolbar to the newly active tab.
+   if (!_hideToolbar && tab->shell) {
+@@ -792,6 +806,9 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   [tab->webView removeFromSuperview];
+   [tab->rowView removeFromSuperview];
+   tab->shell = nullptr;
++  [_selection removeObject:tab];
++  if (_selectionAnchor == tab)
++    _selectionAnchor = nil;
+   TabNode* oldParent = tab->parent;
+   [self detachNode:tab];
+   if (oldParent)
+@@ -891,8 +908,11 @@ - (void)newTab:(id)sender {
+                                   content::Shell::GetShellDefaultSize());
+ }
+ 
+-// A plain click on a row: a folder toggles open/closed; a tab is activated.
+-- (void)rowClicked:(TabNode*)node {
++// A click on a row. A folder always toggles open/closed. For a tab, the
++// modifiers decide: ⌘ toggles it in the multi-selection, Shift extends a range
++// from the anchor, and a plain click activates it (and resets the selection to
++// just that tab). Only a plain click loads/shows the tab.
++- (void)rowClicked:(TabNode*)node modifiers:(NSEventModifierFlags)modifiers {
+   if (!node)
+     return;
+   if (node->kind == TabNodeKindFolder) {
+@@ -901,11 +921,54 @@ - (void)rowClicked:(TabNode*)node {
+     [self layoutTabRows];
+     return;
+   }
++
++  BOOL command = (modifiers & NSEventModifierFlagCommand) != 0;
++  BOOL shift = (modifiers & NSEventModifierFlagShift) != 0;
++
++  if (command) {
++    if ([_selection containsObject:node])
++      [_selection removeObject:node];
++    else
++      [_selection addObject:node];
++    _selectionAnchor = node;
++    [self restyleAllRows];
++    return;
++  }
++
++  if (shift && _selectionAnchor) {
++    [self selectRangeFromAnchorTo:node];
++    [self restyleAllRows];
++    return;
++  }
++
++  // Plain click: selection collapses to this tab, and we activate it.
++  [_selection removeAllObjects];
++  [_selection addObject:node];
++  _selectionAnchor = node;
+   [self activateTab:node];
++  [self restyleAllRows];
+   if (node->shell)
+     node->shell->web_contents()->Focus();
+ }
+ 
++// Selects every tab between the anchor and `node` in the visible flat order
++// (inclusive), skipping folder rows.
++- (void)selectRangeFromAnchorTo:(TabNode*)node {
++  [self rebuildFlatRows];
++  NSUInteger a = [_flatRows indexOfObject:_selectionAnchor];
++  NSUInteger b = [_flatRows indexOfObject:node];
++  if (a == NSNotFound || b == NSNotFound)
++    return;
++  NSUInteger lo = std::min(a, b);
++  NSUInteger hi = std::max(a, b);
++  [_selection removeAllObjects];
++  for (NSUInteger i = lo; i <= hi; ++i) {
++    TabNode* n = _flatRows[i];
++    if (n->kind == TabNodeKindTab)
++      [_selection addObject:n];
++  }
++}
++
+ - (void)closeTabButton:(id)sender {
+   TabNode* tab = [self tabForCloseButton:sender in:_tabs];
+   // Close() deletes the Shell, which calls back into removeTabForShell:.
+@@ -927,6 +990,218 @@ - (TabNode*)tabForCloseButton:(id)button in:(NSArray<TabNode*>*)nodes {
+   return nil;
+ }
+ 
++// --- Context menu ----------------------------------------------------------
++
++- (NSArray<TabNode*>*)allFolders {
++  NSMutableArray<TabNode*>* out = [NSMutableArray array];
++  for (TabNode* node in [self allNodes])
++    if (node->kind == TabNodeKindFolder)
++      [out addObject:node];
++  return out;
++}
++
++- (void)collectTabsIn:(NSArray<TabNode*>*)nodes
++                 into:(NSMutableArray<TabNode*>*)out {
++  for (TabNode* node in nodes) {
++    if (node->kind == TabNodeKindTab)
++      [out addObject:node];
++    if (node->children)
++      [self collectTabsIn:node->children into:out];
++  }
++}
++
++// The selected tabs in visible (flat) order — the order menu actions act in.
++- (NSArray<TabNode*>*)selectionInFlatOrder {
++  [self rebuildFlatRows];
++  NSMutableArray<TabNode*>* out = [NSMutableArray array];
++  for (TabNode* node in _flatRows)
++    if ([_selection containsObject:node])
++      [out addObject:node];
++  return out;
++}
++
++- (NSMenu*)contextMenuForNode:(TabNode*)node {
++  if (!node)
++    return nil;
++
++  // Right-clicking a tab that isn't already selected makes it the selection,
++  // matching how Finder/most lists behave.
++  if (node->kind == TabNodeKindTab && ![_selection containsObject:node]) {
++    [_selection removeAllObjects];
++    [_selection addObject:node];
++    _selectionAnchor = node;
++    [self restyleAllRows];
++  }
++
++  NSMenu* menu = [[NSMenu alloc] init];
++
++  if (node->kind == TabNodeKindFolder) {
++    // Folder menu. PR 9 will add a "Rename Folder…" item here.
++    NSMenuItem* close =
++        [[NSMenuItem alloc] initWithTitle:@"Close Folder"
++                                   action:@selector(closeFolderFromMenu:)
++                            keyEquivalent:@""];
++    close.target = self;
++    close.representedObject = node;
++    [menu addItem:close];
++    return menu;
++  }
++
++  NSUInteger count = _selection.count;
++  NSString* closeTitle = (count > 1)
++                             ? [NSString stringWithFormat:@"Close %lu Tabs",
++                                                          (unsigned long)count]
++                             : @"Close Tab";
++  NSMenuItem* close =
++      [[NSMenuItem alloc] initWithTitle:closeTitle
++                                 action:@selector(closeSelectionFromMenu:)
++                          keyEquivalent:@""];
++  close.target = self;
++  [menu addItem:close];
++
++  [menu addItem:[NSMenuItem separatorItem]];
++
++  NSMenuItem* newFolder = [[NSMenuItem alloc]
++      initWithTitle:@"Move to New Folder"
++             action:@selector(moveSelectionToNewFolderFromMenu:)
++      keyEquivalent:@""];
++  newFolder.target = self;
++  [menu addItem:newFolder];
++
++  NSArray<TabNode*>* folders = [self allFolders];
++  if (folders.count > 0) {
++    NSMenuItem* moveItem = [[NSMenuItem alloc] initWithTitle:@"Move to Folder"
++                                                     action:nil
++                                              keyEquivalent:@""];
++    NSMenu* submenu = [[NSMenu alloc] init];
++    for (TabNode* folder in folders) {
++      NSString* name =
++          folder->folderTitle.length ? folder->folderTitle : @"Folder";
++      NSMenuItem* item = [[NSMenuItem alloc]
++          initWithTitle:name
++                 action:@selector(moveSelectionToFolderFromMenu:)
++          keyEquivalent:@""];
++      item.target = self;
++      item.representedObject = folder;
++      [submenu addItem:item];
++    }
++    moveItem.submenu = submenu;
++    [menu addItem:moveItem];
++  }
++
++  [menu addItem:[NSMenuItem separatorItem]];
++
++  NSString* bmTitle =
++      (count > 1) ? [NSString stringWithFormat:@"Add %lu Tabs to Bookmarks",
++                                               (unsigned long)count]
++                  : @"Add to Bookmarks";
++  NSMenuItem* bookmark =
++      [[NSMenuItem alloc] initWithTitle:bmTitle
++                                 action:@selector(addSelectionToBookmarksFromMenu:)
++                          keyEquivalent:@""];
++  bookmark.target = self;
++  [menu addItem:bookmark];
++
++  return menu;
++}
++
++- (void)closeSelectionFromMenu:(id)sender {
++  NSArray<TabNode*>* snapshot = [_selection copy];
++  [_selection removeAllObjects];
++  for (TabNode* tab in snapshot) {
++    // Close() deletes the Shell -> removeTabForShell: updates the tree/UI.
++    if (tab->shell)
++      tab->shell->Close();
++  }
++}
++
++// Moves all selected tabs into a freshly created folder placed at the topmost
++// selected tab's slot.
++- (void)moveSelectionToNewFolderFromMenu:(id)sender {
++  NSArray<TabNode*>* ordered = [self selectionInFlatOrder];
++  if (ordered.count == 0)
++    return;
++  TabNode* topmost = ordered.firstObject;
++
++  TabNode* folder = [self makeFolderNode];
++  [_sidebar addSubview:folder->rowView];
++  NSMutableArray<TabNode*>* container =
++      topmost->parent ? topmost->parent->children : _tabs;
++  NSUInteger idx = [container indexOfObject:topmost];
++  if (idx == NSNotFound)
++    idx = container.count;
++  folder->parent = topmost->parent;
++  [container insertObject:folder atIndex:idx];
++
++  [self moveTabs:ordered intoFolder:folder];
++}
++
++- (void)moveSelectionToFolderFromMenu:(id)sender {
++  TabNode* folder = [sender representedObject];
++  if (!folder || folder->kind != TabNodeKindFolder)
++    return;
++  [self moveTabs:[self selectionInFlatOrder] intoFolder:folder];
++}
++
++// Shared mover: reparents `tabs` into `folder`, then prunes any folders they
++// left behind.
++- (void)moveTabs:(NSArray<TabNode*>*)tabs intoFolder:(TabNode*)folder {
++  NSMutableSet<TabNode*>* oldParents = [NSMutableSet set];
++  for (TabNode* tab in tabs) {
++    if (tab == folder)
++      continue;
++    TabNode* op = tab->parent;
++    if (op && op != folder)
++      [oldParents addObject:op];
++    [self detachNode:tab];
++    [folder->children addObject:tab];
++    tab->parent = folder;
++  }
++  folder->expanded = YES;
++  [self updateFolderTitle:folder];
++  for (TabNode* op in oldParents)
++    [self pruneFolder:op];
++  [self layoutTabRows];
++}
++
++- (void)addSelectionToBookmarksFromMenu:(id)sender {
++  NSArray<TabNode*>* ordered = [self selectionInFlatOrder];
++  if (ordered.count == 0)
++    return;
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue bookmarks = client->GetBookmarks();
++  if (!bookmarks.contains("version"))
++    bookmarks.Set("version", 1);
++  base::ListValue* roots = bookmarks.EnsureList("roots");
++  for (TabNode* tab in ordered) {
++    if (!tab->shell)
++      continue;
++    GURL url = tab->shell->web_contents()->GetLastCommittedURL();
++    if (url.is_empty())
++      continue;
++    std::string title = base::UTF16ToUTF8(tab->shell->web_contents()->GetTitle());
++    base::DictValue entry;
++    entry.Set("type", "bookmark");
++    entry.Set("title", title);
++    entry.Set("url", url.spec());
++    roots->Append(std::move(entry));
++  }
++  client->SetBookmarks(std::move(bookmarks));
++  [self rebuildBookmarkBar];
++}
++
++- (void)closeFolderFromMenu:(id)sender {
++  TabNode* folder = [sender representedObject];
++  if (!folder || folder->kind != TabNodeKindFolder)
++    return;
++  NSMutableArray<TabNode*>* tabs = [NSMutableArray array];
++  [self collectTabsIn:folder->children into:tabs];
++  for (TabNode* tab in tabs)
++    if (tab->shell)
++      tab->shell->Close();
++}
++
+ // --- Drag & drop -----------------------------------------------------------
+ 
+ - (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event {
+@@ -1096,6 +1371,11 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+   return [self.controller performDropOnNode:self.node];
+ }
+ 
++// Right-click on the row (outside the title button) shows the context menu.
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  return [self.controller contextMenuForNode:self.node];
++}
++
+ @end
+ 
+ @implementation TabTitleButton
+@@ -1109,12 +1389,16 @@ @implementation TabTitleButton
+ // drag.)
+ - (void)mouseDown:(NSEvent*)event {
+   NSPoint start = event.locationInWindow;
++  // OR in the live modifier state as well as the event's: synthetic input
++  // (and some edge cases) can leave the event's own flags unset.
++  NSEventModifierFlags modifiers =
++      event.modifierFlags | NSEvent.modifierFlags;
+   while (true) {
+     NSEvent* next =
+         [self.window nextEventMatchingMask:(NSEventMaskLeftMouseUp |
+                                             NSEventMaskLeftMouseDragged)];
+     if (!next || next.type == NSEventTypeLeftMouseUp) {
+-      [self.controller rowClicked:self.node];
++      [self.controller rowClicked:self.node modifiers:modifiers];
+       return;
+     }
+     NSPoint p = next.locationInWindow;
+@@ -1125,6 +1409,11 @@ - (void)mouseDown:(NSEvent*)event {
+   }
+ }
+ 
++// Right-click anywhere on the title shows the row's context menu.
++- (NSMenu*)menuForEvent:(NSEvent*)event {
++  return [self.controller contextMenuForNode:self.node];
++}
++
+ @end
+ 
+ namespace content {

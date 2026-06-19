@@ -49,6 +49,17 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   different destination with no source-side change. Touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
   `0005`** (it builds on the `0005` tree model).
+- **`0007-multi-select-context-menu.patch`** — **multi-select tabs + a right-click context menu**.
+  ⌘-click toggles a tab in/out of the selection; Shift-click selects a contiguous range from the
+  anchor (over the visible flat order); a plain click activates a tab and collapses the selection
+  onto it. Selected (but not active) rows get a translucent accent highlight, a third row state
+  added to `restyleRow:`. Right-clicking a tab row shows a menu acting on the whole selection —
+  **Close N Tabs**, **Move to New Folder** (created at the topmost selected tab's slot), **Move to
+  Folder ▸** (submenu of existing folders), **Add N Tabs to Bookmarks** (reuses the `0003` store +
+  bookmark bar); right-clicking a folder row shows **Close Folder** (closes all tabs within).
+  Right-clicking an unselected row first makes it the selection (Finder-style). Touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
+  `0005`/`0006`** (uses the `0006` tree mutation/`makeFolderNode` and the `0003` bookmark store).
 
 ## Workflow
 
