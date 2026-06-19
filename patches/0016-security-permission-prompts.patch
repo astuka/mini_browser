@@ -1,0 +1,422 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 86ee3f631f..18a9f3f8f4 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -166,6 +166,10 @@ inline constexpr char kBookmarks[] = "content_shell.bookmarks";
+ // GetSession / SetSession), so tabs and folders can be restored on launch.
+ inline constexpr char kSession[] = "content_shell.session";
+ 
++// Per-origin site settings (permission decisions, etc.), a JSON dict in local
++// state keyed by origin (see GetSitePermission / SetSitePermission).
++inline constexpr char kSiteSettings[] = "content_shell.site_settings";
++
+ using PerformanceManagerRegistry =
+     performance_manager::PerformanceManagerRegistry;
+ 
+@@ -306,6 +310,7 @@ std::unique_ptr<PrefService> CreateLocalState() {
+   variations::VariationsService::RegisterPrefs(pref_registry.get());
+   pref_registry->RegisterDictionaryPref(kBookmarks);
+   pref_registry->RegisterDictionaryPref(kSession);
++  pref_registry->RegisterDictionaryPref(kSiteSettings);
+ 
+ #if BUILDFLAG(IS_IOS)
+   pref_registry->RegisterBooleanPref(kJITEnabled, true);
+@@ -510,6 +515,27 @@ void ShellContentBrowserClient::SetSession(base::DictValue session) {
+   GetSharedState().local_state->CommitPendingWrite();
+ }
+ 
++std::optional<bool> ShellContentBrowserClient::GetSitePermission(
++    const std::string& origin,
++    const std::string& key) {
++  const base::DictValue& settings =
++      GetSharedState().local_state->GetDict(kSiteSettings);
++  const base::DictValue* origin_dict = settings.FindDict(origin);
++  if (!origin_dict)
++    return std::nullopt;
++  return origin_dict->FindBool(key);
++}
++
++void ShellContentBrowserClient::SetSitePermission(const std::string& origin,
++                                                  const std::string& key,
++                                                  bool allow) {
++  base::DictValue settings =
++      GetSharedState().local_state->GetDict(kSiteSettings).Clone();
++  settings.EnsureDict(origin)->Set(key, allow);
++  GetSharedState().local_state->SetDict(kSiteSettings, std::move(settings));
++  GetSharedState().local_state->CommitPendingWrite();
++}
++
+ device::GeolocationSystemPermissionManager*
+ ShellContentBrowserClient::GetGeolocationSystemPermissionManager() {
+ #if BUILDFLAG(IS_MAC)
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index ee19fa9e73..053b164416 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -6,6 +6,7 @@
+ #define CONTENT_SHELL_BROWSER_SHELL_CONTENT_BROWSER_CLIENT_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/files/file_path.h"
+@@ -228,6 +229,17 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   base::DictValue GetSession();
+   void SetSession(base::DictValue session);
+ 
++  // Per-origin site settings (permission decisions, etc.), persisted as a JSON
++  // dict in local state keyed by origin. GetSitePermission returns the saved
++  // decision (true=allow, false=block) for (origin, key), or nullopt if the
++  // user hasn't decided yet. Shared by the permission prompts and (later) the
++  // per-site content settings.
++  std::optional<bool> GetSitePermission(const std::string& origin,
++                                        const std::string& key);
++  void SetSitePermission(const std::string& origin,
++                         const std::string& key,
++                         bool allow);
++
+  protected:
+   // Call this if CreateBrowserMainParts() is overridden in a subclass.
+   void set_browser_main_parts(ShellBrowserMainParts* parts);
+diff --git a/content/shell/browser/shell_permission_manager.cc b/content/shell/browser/shell_permission_manager.cc
+index d1a8368215..f53b35c86b 100644
+--- a/content/shell/browser/shell_permission_manager.cc
++++ b/content/shell/browser/shell_permission_manager.cc
+@@ -4,14 +4,25 @@
+ 
+ #include "content/shell/browser/shell_permission_manager.h"
+ 
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
+ #include "base/command_line.h"
++#include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "build/build_config.h"
+ #include "components/content_settings/core/common/features.h"
+ #include "components/permissions/permission_util.h"
+ #include "content/public/browser/permission_controller.h"
+ #include "content/public/browser/permission_result.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_switches.h"
++#include "content/shell/browser/shell_content_browser_client.h"
++#include "content/shell/browser/shell_platform_delegate.h"
+ #include "content/shell/common/shell_switches.h"
+ #include "media/base/media_switches.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -85,6 +96,159 @@ bool IsAllowlistedPermissionType(PermissionType permission) {
+   NOTREACHED();
+ }
+ 
++// Permissions we surface a real prompt for (instead of the test-shell's
++// auto-grant/deny). Everything else keeps the IsAllowlistedPermissionType
++// behavior.
++bool IsPromptablePermission(PermissionType permission) {
++  switch (permission) {
++    case PermissionType::GEOLOCATION:
++    case PermissionType::GEOLOCATION_APPROXIMATE:
++    case PermissionType::NOTIFICATIONS:
++    case PermissionType::AUDIO_CAPTURE:
++    case PermissionType::VIDEO_CAPTURE:
++    case PermissionType::CLIPBOARD_READ_WRITE:
++      return true;
++    default:
++      return false;
++  }
++}
++
++// Stable per-origin storage key for a promptable permission.
++std::string PermissionKey(PermissionType permission) {
++  switch (permission) {
++    case PermissionType::GEOLOCATION:
++    case PermissionType::GEOLOCATION_APPROXIMATE:
++      return "geolocation";
++    case PermissionType::NOTIFICATIONS:
++      return "notifications";
++    case PermissionType::AUDIO_CAPTURE:
++      return "microphone";
++    case PermissionType::VIDEO_CAPTURE:
++      return "camera";
++    case PermissionType::CLIPBOARD_READ_WRITE:
++      return "clipboard";
++    default:
++      return "other";
++  }
++}
++
++std::string PermissionPromptMessage(PermissionType permission,
++                                    const std::string& host) {
++  std::string what;
++  switch (permission) {
++    case PermissionType::GEOLOCATION:
++    case PermissionType::GEOLOCATION_APPROXIMATE:
++      what = "know your location";
++      break;
++    case PermissionType::NOTIFICATIONS:
++      what = "show notifications";
++      break;
++    case PermissionType::AUDIO_CAPTURE:
++      what = "use your microphone";
++      break;
++    case PermissionType::VIDEO_CAPTURE:
++      what = "use your camera";
++      break;
++    case PermissionType::CLIPBOARD_READ_WRITE:
++      what = "read from your clipboard";
++      break;
++    default:
++      what = "use a device feature";
++      break;
++  }
++  return "Allow " + (host.empty() ? std::string("this site") : host) + " to " +
++         what + "?";
++}
++
++std::string OriginKey(const GURL& url) {
++  return url::Origin::Create(url).Serialize();
++}
++
++// Builds a PermissionResult, preserving the GeolocationSetting that the
++// approximate-geolocation feature expects when granting geolocation.
++PermissionResult MakeResult(PermissionType type, bool allow) {
++  blink::mojom::PermissionStatus status =
++      allow ? blink::mojom::PermissionStatus::GRANTED
++            : blink::mojom::PermissionStatus::DENIED;
++  if (allow &&
++      (type == PermissionType::GEOLOCATION ||
++       type == PermissionType::GEOLOCATION_APPROXIMATE) &&
++      base::FeatureList::IsEnabled(
++          content_settings::features::kApproximateGeolocationPermission)) {
++    GeolocationSetting setting = {PermissionOption::kAllowed,
++                                  PermissionOption::kAllowed};
++    return PermissionResult(status, PermissionStatusSource::UNSPECIFIED,
++                            setting);
++  }
++  return PermissionResult(status);
++}
++
++// Resolves a list of permission requests one at a time — using a saved per-
++// origin decision when present, otherwise prompting the user (and saving the
++// answer). Self-owned: deletes itself once every permission is resolved.
++class PermissionPromptFlow {
++ public:
++  PermissionPromptFlow(
++      WebContents* web_contents,
++      std::string origin,
++      std::vector<PermissionType> types,
++      base::OnceCallback<void(const std::vector<PermissionResult>&)> callback)
++      : web_contents_(web_contents ? web_contents->GetWeakPtr() : nullptr),
++        origin_(std::move(origin)),
++        types_(std::move(types)),
++        callback_(std::move(callback)) {}
++
++  void Start() { ProcessNext(); }
++
++ private:
++  void ProcessNext() {
++    if (results_.size() >= types_.size()) {
++      std::move(callback_).Run(results_);
++      delete this;
++      return;
++    }
++    PermissionType type = types_[results_.size()];
++    if (!IsPromptablePermission(type)) {
++      results_.push_back(MakeResult(type, IsAllowlistedPermissionType(type)));
++      ProcessNext();
++      return;
++    }
++    std::string key = PermissionKey(type);
++    std::optional<bool> saved =
++        ShellContentBrowserClient::Get()->GetSitePermission(origin_, key);
++    if (saved.has_value()) {
++      results_.push_back(MakeResult(type, *saved));
++      ProcessNext();
++      return;
++    }
++#if BUILDFLAG(IS_MAC)
++    if (web_contents_) {
++      GURL origin_url(origin_);
++      ShellPlatformDelegate::RequestPermissionDecision(
++          web_contents_.get(),
++          PermissionPromptMessage(type, std::string(origin_url.host())),
++          base::BindOnce(&PermissionPromptFlow::OnDecision,
++                         base::Unretained(this), type, key));
++      return;
++    }
++#endif
++    results_.push_back(MakeResult(type, false));
++    ProcessNext();
++  }
++
++  void OnDecision(PermissionType type, std::string key, bool allow) {
++    ShellContentBrowserClient::Get()->SetSitePermission(origin_, key, allow);
++    results_.push_back(MakeResult(type, allow));
++    ProcessNext();
++  }
++
++  base::WeakPtr<WebContents> web_contents_;
++  std::string origin_;
++  std::vector<PermissionType> types_;
++  std::vector<PermissionResult> results_;
++  base::OnceCallback<void(const std::vector<PermissionResult>&)> callback_;
++};
++
+ }  // namespace
+ 
+ ShellPermissionManager::ShellPermissionManager() = default;
+@@ -108,27 +272,21 @@ void ShellPermissionManager::RequestPermissionsFromCurrentDocument(
+         PermissionResult(blink::mojom::PermissionStatus::DENIED)));
+     return;
+   }
+-  std::vector<PermissionResult> result;
+-  blink::PermissionType permission_type;
+-  for (const auto& permission : request_description.permissions) {
+-    permission_type = blink::PermissionDescriptorToPermissionType(permission);
+-    // When the `ApproximateGeolocationPermission` feature is enabled, granting
+-    // geolocation requires more granular control via `GeolocationSetting`.
+-    if (base::FeatureList::IsEnabled(
+-            content_settings::features::kApproximateGeolocationPermission) &&
+-        permission_type == blink::PermissionType::GEOLOCATION &&
+-        IsAllowlistedPermissionType(permission_type)) {
+-      GeolocationSetting setting = {PermissionOption::kAllowed,
+-                                    PermissionOption::kAllowed};
+-      result.emplace_back(blink::mojom::PermissionStatus::GRANTED,
+-                          PermissionStatusSource::UNSPECIFIED, setting);
+-    } else {
+-      result.emplace_back(IsAllowlistedPermissionType(permission_type)
+-                              ? blink::mojom::PermissionStatus::GRANTED
+-                              : blink::mojom::PermissionStatus::DENIED);
+-    }
+-  }
+-  std::move(callback).Run(result);
++  std::vector<PermissionType> types;
++  types.reserve(request_description.permissions.size());
++  for (const auto& permission : request_description.permissions)
++    types.push_back(blink::PermissionDescriptorToPermissionType(permission));
++
++  GURL origin_url =
++      permissions::PermissionUtil::GetLastCommittedOriginAsURL(
++          render_frame_host);
++  WebContents* web_contents =
++      WebContents::FromRenderFrameHost(render_frame_host);
++  // Self-owned; resolves each permission (saved decision or a prompt) and
++  // deletes itself when done.
++  (new PermissionPromptFlow(web_contents, OriginKey(origin_url),
++                            std::move(types), std::move(callback)))
++      ->Start();
+ }
+ 
+ blink::mojom::PermissionStatus ShellPermissionManager::GetPermissionStatus(
+@@ -148,6 +306,18 @@ blink::mojom::PermissionStatus ShellPermissionManager::GetPermissionStatus(
+     return blink::mojom::PermissionStatus::GRANTED;
+   }
+ 
++  // For permissions we prompt on, reflect the saved per-origin decision (or ASK
++  // when the user hasn't decided yet).
++  if (IsPromptablePermission(permission_type)) {
++    std::optional<bool> saved =
++        ShellContentBrowserClient::Get()->GetSitePermission(
++            OriginKey(requesting_origin), PermissionKey(permission_type));
++    if (saved.has_value())
++      return *saved ? blink::mojom::PermissionStatus::GRANTED
++                    : blink::mojom::PermissionStatus::DENIED;
++    return blink::mojom::PermissionStatus::ASK;
++  }
++
+   return IsAllowlistedPermissionType(permission_type)
+              ? blink::mojom::PermissionStatus::GRANTED
+              : blink::mojom::PermissionStatus::DENIED;
+diff --git a/content/shell/browser/shell_platform_delegate.h b/content/shell/browser/shell_platform_delegate.h
+index 121f358af0..c129c726e5 100644
+--- a/content/shell/browser/shell_platform_delegate.h
++++ b/content/shell/browser/shell_platform_delegate.h
+@@ -168,6 +168,13 @@ class ShellPlatformDelegate {
+       WebContents* web_contents,
+       const GURL& url,
+       base::OnceCallback<void(bool)> callback);
++
++  // Shows a permission prompt (sheet) with |message| and runs |callback| with
++  // the user's choice (true = allow, false = block).
++  static void RequestPermissionDecision(
++      WebContents* web_contents,
++      const std::string& message,
++      base::OnceCallback<void(bool)> callback);
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index cf90e89f90..e315ff423b 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -238,6 +238,9 @@ - (void)presentHttpFallbackForShell:(content::Shell*)shell
+ - (void)presentBlocklistForShell:(content::Shell*)shell
+                              url:(const GURL&)url
+                        onResolve:(void (^)(BOOL proceed))resolve;
++- (void)presentPermissionPromptForShell:(content::Shell*)shell
++                                message:(NSString*)message
++                              onResolve:(void (^)(BOOL allow))resolve;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1428,6 +1431,28 @@ - (void)presentBlocklistForShell:(content::Shell*)shell
+                        }];
+ }
+ 
++// Permission prompt: a sheet with Allow / Block. Unlike the page-blocking
++// interstitials, a permission request is a transient dialog.
++- (void)presentPermissionPromptForShell:(content::Shell*)shell
++                                message:(NSString*)message
++                              onResolve:(void (^)(BOOL allow))resolve {
++  if (!_window) {
++    if (resolve)
++      resolve(NO);
++    return;
++  }
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = @"Permission request";
++  alert.informativeText = message;
++  [alert addButtonWithTitle:@"Allow"];
++  [alert addButtonWithTitle:@"Block"];
++  [alert beginSheetModalForWindow:_window
++                completionHandler:^(NSModalResponse response) {
++                  if (resolve)
++                    resolve(response == NSAlertFirstButtonReturn);
++                }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2467,6 +2492,27 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+   [g_tab_controller presentBlocklistForShell:shell url:url onResolve:resolve];
+ }
+ 
++// static
++void ShellPlatformDelegate::RequestPermissionDecision(
++    WebContents* web_contents,
++    const std::string& message,
++    base::OnceCallback<void(bool)> callback) {
++  __block base::OnceCallback<void(bool)> cb = std::move(callback);
++  void (^resolve)(BOOL) = ^(BOOL allow) {
++    if (cb)
++      std::move(cb).Run(allow);
++  };
++  Shell* shell = Shell::FromWebContents(web_contents);
++  if (!shell || !g_tab_controller) {
++    resolve(NO);
++    return;
++  }
++  [g_tab_controller presentPermissionPromptForShell:shell
++                                            message:base::SysUTF8ToNSString(
++                                                        message)
++                                          onResolve:resolve];
++}
++
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,
+     WebContents* source,
