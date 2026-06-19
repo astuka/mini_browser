@@ -63,8 +63,9 @@ Run it:
 - 🛠️ **Customizations** (as `patches/`): vertical tab strip on the left, with background
   tabs (cmd+click) that flash the strip instead of stealing focus; SF Symbol icons on the
   Back/Forward/Reload/Stop buttons; a horizontal bookmark bar (persisted via the browser's
-  PrefService); and collapsible **tab folders** — drag one tab onto another to group them,
-  click to collapse/expand. See `patches/README.md`.
+  PrefService); collapsible **tab folders** — drag one tab onto another to group them,
+  click to collapse/expand; and **multi-select** (⌘/Shift-click) with a right-click context
+  menu (close, move to folder, add to bookmarks). See `patches/README.md`.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
