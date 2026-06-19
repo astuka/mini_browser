@@ -73,8 +73,9 @@ Run it:
   content_shell, from scratch (no `//chrome`). So far: a connection-security indicator
   (lock / "Not Secure") derived ourselves from the navigation's TLS state; a certificate
   viewer (subject / issuer / validity / SANs); a real certificate-error interstitial
-  ("Your connection is not private" with Back-to-safety / Proceed); and HTTPS-First mode
-  (upgrades http→https, with a fallback interstitial when a site has no HTTPS).
+  ("Your connection is not private" with Back-to-safety / Proceed); HTTPS-First mode
+  (upgrades http→https, with a fallback interstitial when a site has no HTTPS); and a
+  local URL blocklist (our own miniature "Safe Browsing" with a dangerous-site interstitial).
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
