@@ -1,0 +1,153 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 8d444fc62d..4ee5b53475 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -85,6 +85,14 @@ @interface TabTitleButton : NSButton
+ @property(weak) TabNode* node;
+ @end
+ 
++// The horizontal bookmark bar, also a drag DESTINATION: a tab row dragged from
++// the strip and dropped here is bookmarked (a Copy — the tab stays put). Reuses
++// the same kTabRowPasteboardType the rows already publish, so no source-side
++// change was needed. Decisions are delegated to the controller.
++@interface BookmarkBarView : NSView <NSDraggingDestination>
++@property(weak) TabbedShellController* controller;
++@end
++
+ // A view whose coordinate origin is the top-left, so the tab strip stacks
+ // downward naturally.
+ @interface FlippedView : NSView
+@@ -178,6 +186,10 @@ - (NSDragOperation)dragOverNode:(TabNode*)target;
+ - (void)dragExitedNode:(TabNode*)target;
+ - (BOOL)performDropOnNode:(TabNode*)target;
+ - (void)dragSessionEnded;
++// Bookmark-bar drop target, called from BookmarkBarView:
++- (NSDragOperation)bookmarkBarDragEntered;
++- (void)bookmarkBarDragExited;
++- (BOOL)performBookmarkBarDrop;
+ @end
+ 
+ namespace {
+@@ -283,11 +295,16 @@ - (instancetype)initWithContentSize:(NSSize)size {
+     _urlField.cell.scrollable = YES;
+     [content addSubview:_urlField];
+ 
+-    // Horizontal bookmark bar, between the toolbar and the content area.
+-    _bookmarkBar = [[NSView alloc]
++    // Horizontal bookmark bar, between the toolbar and the content area. It's
++    // also a drop target: a tab row dragged onto it gets bookmarked.
++    BookmarkBarView* bar = [[BookmarkBarView alloc]
+         initWithFrame:NSMakeRect(kSidebarWidth, size.height, size.width,
+                                  kBookmarkBarHeight)];
+-    _bookmarkBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
++    bar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
++    bar.wantsLayer = YES;
++    bar.controller = self;
++    [bar registerForDraggedTypes:@[ kTabRowPasteboardType ]];
++    _bookmarkBar = bar;
+     [content addSubview:_bookmarkBar];
+ 
+     // A "+" button pinned to the right of the bar bookmarks the active page.
+@@ -1309,6 +1326,55 @@ - (void)dragSessionEnded {
+   _draggingNode = nil;
+   if (prev)
+     [self restyleRow:prev];
++  [self setBookmarkBarHighlighted:NO];
++}
++
++// A tab dragged over the bookmark bar can be dropped to bookmark it (Copy). A
++// folder being dragged isn't (it has no single URL).
++- (NSDragOperation)bookmarkBarDragEntered {
++  if (!_draggingNode || _draggingNode->kind != TabNodeKindTab)
++    return NSDragOperationNone;
++  [self setBookmarkBarHighlighted:YES];
++  return NSDragOperationCopy;
++}
++
++- (void)bookmarkBarDragExited {
++  [self setBookmarkBarHighlighted:NO];
++}
++
++- (void)setBookmarkBarHighlighted:(BOOL)on {
++  if (!_bookmarkBar.wantsLayer)
++    return;
++  _bookmarkBar.layer.backgroundColor =
++      on ? [NSColor.controlAccentColor colorWithAlphaComponent:0.30].CGColor
++         : NSColor.clearColor.CGColor;
++}
++
++- (BOOL)performBookmarkBarDrop {
++  TabNode* tab = _draggingNode;
++  [self setBookmarkBarHighlighted:NO];
++  if (!tab || tab->kind != TabNodeKindTab || !tab->shell)
++    return NO;
++  GURL url = tab->shell->web_contents()->GetLastCommittedURL();
++  if (url.is_empty())
++    return NO;
++  std::string title = base::UTF16ToUTF8(tab->shell->web_contents()->GetTitle());
++
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue bookmarks = client->GetBookmarks();
++  if (!bookmarks.contains("version"))
++    bookmarks.Set("version", 1);
++  base::ListValue* roots = bookmarks.EnsureList("roots");
++  base::DictValue entry;
++  entry.Set("type", "bookmark");
++  entry.Set("title", title);
++  entry.Set("url", url.spec());
++  roots->Append(std::move(entry));
++  client->SetBookmarks(std::move(bookmarks));
++
++  [self rebuildBookmarkBar];
++  return YES;
+ }
+ 
+ // --- NSWindowDelegate ------------------------------------------------------
+@@ -1338,10 +1404,11 @@ @implementation TabRowView
+ @synthesize controller = _controller;
+ @synthesize node = _node;
+ 
+-// Source: rows can be moved (to form/join folders).
++// Source: a row can be moved (onto another row, to form/join a folder) or
++// copied (onto the bookmark bar, to bookmark it). The destination picks which.
+ - (NSDragOperation)draggingSession:(NSDraggingSession*)session
+     sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+-  return NSDragOperationMove;
++  return NSDragOperationMove | NSDragOperationCopy;
+ }
+ 
+ - (void)draggingSession:(NSDraggingSession*)session
+@@ -1416,6 +1483,32 @@ - (NSMenu*)menuForEvent:(NSEvent*)event {
+ 
+ @end
+ 
++@implementation BookmarkBarView
++
++@synthesize controller = _controller;
++
++- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
++  return [self.controller bookmarkBarDragEntered];
++}
++
++- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
++  return [self.controller bookmarkBarDragEntered];
++}
++
++- (void)draggingExited:(id<NSDraggingInfo>)sender {
++  [self.controller bookmarkBarDragExited];
++}
++
++- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
++  return YES;
++}
++
++- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
++  return [self.controller performBookmarkBarDrop];
++}
++
++@end
++
+ namespace content {
+ 
+ // These are required by the header (it declares the members), but the tab

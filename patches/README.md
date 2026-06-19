@@ -60,6 +60,15 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   Right-clicking an unselected row first makes it the selection (Finder-style). Touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
   `0005`/`0006`** (uses the `0006` tree mutation/`makeFolderNode` and the `0003` bookmark store).
+- **`0008-drag-tab-to-bookmark-bar.patch`** — **drag a tab onto the bookmark bar to bookmark it**.
+  The bookmark bar is now a `BookmarkBarView` (an `NSDraggingDestination`) that registers the same
+  `kTabRowPasteboardType` the strip rows already publish; dropping a tab row on it appends the tab's
+  title+URL to the `0003` store (op = **Copy**, so the tab stays put) and rebuilds the bar. The bar
+  highlights while a valid drag is over it; dragging a *folder* is rejected (no single URL). The
+  only source-side change is widening the row's drag op to `Move | Copy` so the destination can
+  request a copy — tab→tab stays a Move (the row destination still returns Move). Touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
+  `0005`/`0006`/`0007`** (uses the `0003` store; reuses the `0006` row-drag pasteboard type).
 
 ## Workflow
 
