@@ -65,8 +65,9 @@ Run it:
   Back/Forward/Reload/Stop buttons; a horizontal bookmark bar (persisted via the browser's
   PrefService); collapsible **tab folders** — drag one tab onto another to group them,
   click to collapse/expand; **multi-select** (⌘/Shift-click) with a right-click context
-  menu (close, move to folder, add to bookmarks); and **drag a tab onto the bookmark bar**
-  to bookmark it. See `patches/README.md`.
+  menu (close, move to folder, add to bookmarks); **drag a tab onto the bookmark bar**
+  to bookmark it; and **renamable folders** (right-click or double-click a folder).
+  See `patches/README.md`.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

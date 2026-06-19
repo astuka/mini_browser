@@ -1,0 +1,165 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 4ee5b53475..04cab9f527 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -136,7 +136,8 @@ @implementation TabNode
+ // Owns the single shared browser window and the vertical tab strip. There is
+ // one instance for the whole process (stored in g_tab_controller), matching the
+ // single process-wide ShellPlatformDelegate.
+-@interface TabbedShellController : NSObject <NSWindowDelegate> {
++@interface TabbedShellController : NSObject <NSWindowDelegate,
++                                             NSTextFieldDelegate> {
+   NSWindow* _window;
+   FlippedView* _sidebar;
+   NSButton* _newTabButton;
+@@ -158,6 +159,9 @@ @interface TabbedShellController : NSObject <NSWindowDelegate> {
+   __weak TabNode* _draggingNode;         // The row currently being dragged.
+   __weak TabNode* _dropTargetNode;       // The row currently highlighted as a
+                                          // drop target.
++  TabNode* _renamingFolder;              // The folder whose name is being edited.
++  NSTextField* _renameField;             // Inline editor overlaid on its row.
++  BOOL _renameCancelled;                 // Esc pressed: discard, don't save.
+   BOOL _closingAll;
+   BOOL _hideToolbar;
+   // When set, the next tab created is brought to the foreground (used by the
+@@ -180,6 +184,7 @@ - (void)setEnabled:(BOOL)enabled
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)rowClicked:(TabNode*)node modifiers:(NSEventModifierFlags)modifiers;
++- (void)beginRenameFolder:(TabNode*)folder;
+ - (NSMenu*)contextMenuForNode:(TabNode*)node;
+ - (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event;
+ - (NSDragOperation)dragOverNode:(TabNode*)target;
+@@ -1053,7 +1058,15 @@ - (NSMenu*)contextMenuForNode:(TabNode*)node {
+   NSMenu* menu = [[NSMenu alloc] init];
+ 
+   if (node->kind == TabNodeKindFolder) {
+-    // Folder menu. PR 9 will add a "Rename Folder…" item here.
++    // Folder menu.
++    NSMenuItem* rename =
++        [[NSMenuItem alloc] initWithTitle:@"Rename Folder…"
++                                   action:@selector(renameFolderFromMenu:)
++                            keyEquivalent:@""];
++    rename.target = self;
++    rename.representedObject = node;
++    [menu addItem:rename];
++
+     NSMenuItem* close =
+         [[NSMenuItem alloc] initWithTitle:@"Close Folder"
+                                    action:@selector(closeFolderFromMenu:)
+@@ -1219,6 +1232,101 @@ - (void)closeFolderFromMenu:(id)sender {
+       tab->shell->Close();
+ }
+ 
++// --- Folder rename ---------------------------------------------------------
++
++- (void)renameFolderFromMenu:(id)sender {
++  // Defer until the context menu has fully dismissed: starting the field editor
++  // while the menu is still tearing down is unreliable.
++  TabNode* folder = [sender representedObject];
++  dispatch_async(dispatch_get_main_queue(), ^{
++    [self beginRenameFolder:folder];
++  });
++}
++
++// Overlays an editable text field on the folder's row, seeded with the current
++// name (just the name — not the disclosure triangle or tab count).
++- (void)beginRenameFolder:(TabNode*)folder {
++  if (!folder || folder->kind != TabNodeKindFolder)
++    return;
++  if (_renameField)
++    [self cancelRename];  // Finish any rename already in flight.
++
++  _renamingFolder = folder;
++  _renameCancelled = NO;
++
++  CGFloat indent = [self depthOf:folder] * kIndent;
++  NSRect frame = NSMakeRect(indent, NSMinY(folder->rowView.frame),
++                            kSidebarWidth - indent, kTabRowHeight);
++  NSTextField* field = [[NSTextField alloc] initWithFrame:frame];
++  field.stringValue =
++      folder->folderTitle.length ? folder->folderTitle : @"Folder";
++  field.font = folder->titleButton.font;
++  field.editable = YES;
++  field.selectable = YES;
++  field.bezeled = YES;
++  field.target = self;
++  field.action = @selector(renameFieldAction:);
++  [_sidebar addSubview:field];
++  _renameField = field;
++  [_window makeFirstResponder:field];
++  [field selectText:nil];
++  // Attach the commit delegate only after the field has settled as first
++  // responder: AppKit emits a spurious end-editing *while* the field is
++  // becoming first responder, and handling it would tear the editor down
++  // before the user can type.
++  dispatch_async(dispatch_get_main_queue(), ^{
++    if (self->_renameField == field)
++      field.delegate = self;
++  });
++}
++
++// Return commits by ending editing (handled in controlTextDidEndEditing:).
++- (void)renameFieldAction:(id)sender {
++  [_window makeFirstResponder:nil];
++}
++
++- (void)cancelRename {
++  _renameCancelled = YES;
++  if (_renameField)
++    [_window makeFirstResponder:nil];  // Ends editing; the change is discarded.
++}
++
++// Single commit point for Return, blur, and Esc (via _renameCancelled).
++- (void)controlTextDidEndEditing:(NSNotification*)notification {
++  if (!_renamingFolder || !_renameField)
++    return;
++  TabNode* folder = _renamingFolder;
++  NSString* name = nil;
++  if (!_renameCancelled) {
++    name = [_renameField.stringValue
++        stringByTrimmingCharactersInSet:NSCharacterSet
++                                            .whitespaceAndNewlineCharacterSet];
++  }
++  [_renameField removeFromSuperview];
++  _renameField = nil;
++  _renamingFolder = nil;
++  _renameCancelled = NO;
++  if (name) {
++    folder->folderTitle = name.length ? name : @"Folder";
++    [self updateFolderTitle:folder];
++    [self layoutTabRows];
++  }
++}
++
++// Esc cancels the rename without saving.
++- (BOOL)control:(NSControl*)control
++               textView:(NSTextView*)textView
++    doCommandBySelector:(SEL)commandSelector {
++  // Esc cancels the rename. The field editor routes Escape through either of
++  // these selectors depending on context; both discard the edit.
++  if (commandSelector == @selector(cancelOperation:) ||
++      commandSelector == @selector(complete:)) {
++    [self cancelRename];
++    return YES;
++  }
++  return NO;
++}
++
+ // --- Drag & drop -----------------------------------------------------------
+ 
+ - (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event {
+@@ -1455,6 +1563,13 @@ @implementation TabTitleButton
+ // rely on the button's normal action, because the row underneath needs the
+ // drag.)
+ - (void)mouseDown:(NSEvent*)event {
++  // Double-click a folder row to rename it inline.
++  if (event.clickCount == 2 && self.node &&
++      self.node->kind == TabNodeKindFolder) {
++    [self.controller beginRenameFolder:self.node];
++    return;
++  }
++
+   NSPoint start = event.locationInWindow;
+   // OR in the live modifier state as well as the event's: synthetic input
+   // (and some edge cases) can leave the event's own flags unset.
