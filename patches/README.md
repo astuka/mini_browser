@@ -187,6 +187,25 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `HandleKeyboardEvent`. Touches `content/shell/browser/shell_platform_delegate_mac.mm` only; stacks
   on the full prior chain. **This completes the "Fortify" security epic (`0011`–`0019`).**
 
+### Extension epic ("Graft") — building an extension runtime on content_shell from scratch
+
+- **`0020-extensions-model-and-loader.patch`** — the **extension model + unpacked loader +
+  management UI** (first piece of the extensions epic). content_shell has no extensions layer at
+  all, so we start our own: a persistent installed-extensions registry — `content_shell.extensions`
+  JSON dict pref + `GetExtensions()/SetExtensions()` on `ShellContentBrowserClient` (mirrors the
+  `0003`/`0010` stores) — and an **Extensions manager window (⌘⇧E)** with a **Load Unpacked…**
+  button. Loading a folder reads and parses its `manifest.json` (validating MV3 `name`/`version`,
+  recording `description`, `manifest_version`, `permissions`, `host_permissions`, and the on-disk
+  path), derives the extension **id from the folder path** the way Chrome does for unpacked
+  extensions (SHA-256 → first 16 bytes → `a`–`p` letters, via `//crypto`), and persists it. The
+  manager lists each extension with an **enable/disable** checkbox (dims when off) and a **Remove**
+  button; the list is rebuilt from the store and survives restart. **No execution yet** — this PR
+  only models, loads, and persists what an extension *is*; serving `chrome-extension://` resources
+  and running content scripts come in later patches. Touches `content/shell/BUILD.gn` (adds the
+  `//crypto` dep), `shell_content_browser_client.{cc,h}` (the store), and
+  `shell_platform_delegate_mac.mm` (manifest parsing + manager UI + ⌘⇧E hook); stacks on `0003`/
+  `0010` for the store accessors and on the full `.mm` chain through `0019`.
+
 ## Workflow
 
 `setup.sh` applies every `*.patch` here (in filename order) to the Chromium checkout with

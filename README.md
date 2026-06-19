@@ -81,6 +81,12 @@ Run it:
   third-party-cookie blocking); download safety (dangerous file-type warnings); and a
   Security Diagnostics panel (⌘⇧D — process model, sandbox status, site isolation, per-tab
   renderer PIDs).
+- 🧩 **Extension epic ("Graft") — in progress:** an extension runtime built directly on
+  content_shell, from scratch (no `//chrome/browser/extensions`). So far: an **extension model +
+  unpacked loader + manager** (⌘⇧E) — load an unpacked extension folder, parse its MV3
+  `manifest.json`, derive a Chrome-style id from the path, and list/enable/disable/remove it from a
+  management window, persisted across restarts (no execution yet; `chrome-extension://` resource
+  serving and content-script injection come next).
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
