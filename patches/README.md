@@ -132,6 +132,18 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `ShellPlatformDelegate::RequestHttpFallbackDecision`. Touches `shell_content_browser_client.cc`
   (throttle), `shell_platform_delegate.h` (bridge decl), and `shell_platform_delegate_mac.mm` (UI);
   stacks on `0013` (interstitial primitive) and the full prior chain.
+- **`0015-security-url-blocklist.patch`** — a **local URL-reputation blocklist** (our own miniature
+  "Safe Browsing", no Google SB). A second `NavigationThrottle` (registered *before* the HTTPS-First
+  one) checks each top-level navigation's host against a built-in blocklist (O(1) `flat_set` match,
+  done before the network request — a blocked host needn't even resolve). On a match it reuses the
+  `0013` interstitial to show **"Dangerous site blocked"** with **Visit anyway (dangerous)**
+  (allowlists the host for the session and `Resume()`s the navigation) / **Back to safety** (cancel).
+  Seeded with a few test hosts (incl. Google's real `testsafebrowsing.appspot.com`); a real
+  deployment would load a hosts-style list. Bridged via a new static
+  `ShellPlatformDelegate::RequestBlocklistDecision`. Touches `shell_content_browser_client.cc`
+  (throttle), `shell_platform_delegate.h` (bridge decl), and `shell_platform_delegate_mac.mm` (UI);
+  stacks on `0013`/`0014` and the full prior chain. (This is the same request-interception groundwork
+  the planned extensions ad-blocker will reuse.)
 
 ## Workflow
 

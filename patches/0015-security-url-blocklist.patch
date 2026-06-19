@@ -1,0 +1,187 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 4a2eac3828..86ee3f631f 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -31,6 +31,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/sequence_local_storage_slot.h"
+ #include "base/values.h"
++#include "base/containers/flat_set.h"
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
+@@ -799,10 +800,76 @@ class HttpsUpgradeThrottle : public NavigationThrottle {
+   base::WeakPtrFactory<HttpsUpgradeThrottle> weak_factory_{this};
+ };
+ 
++// A local URL-reputation blocklist — our own miniature "Safe Browsing." A real
++// deployment would load a hosts-style list (e.g. StevenBlack); here we ship a
++// small built-in seed. Lookups are O(1) host-string matches done before the
++// network request, so a blocked host needn't even resolve.
++const base::flat_set<std::string_view>& Blocklist() {
++  static const base::NoDestructor<base::flat_set<std::string_view>> list({
++      "testsafebrowsing.appspot.com",  // Google's real Safe Browsing test host.
++      "malware.testing.google.test",
++      "malware.example",
++      "phishing.example",
++  });
++  return *list;
++}
++
++// Hosts the user chose to visit anyway this session.
++std::set<std::string>& BlocklistAllowlist() {
++  static base::NoDestructor<std::set<std::string>> allowlist;
++  return *allowlist;
++}
++
++// Blocks navigations to known-bad hosts with a warning interstitial. Built from
++// scratch (no Google Safe Browsing).
++class BlocklistThrottle : public NavigationThrottle {
++ public:
++  explicit BlocklistThrottle(NavigationThrottleRegistry& registry)
++      : NavigationThrottle(registry) {}
++  ~BlocklistThrottle() override = default;
++
++  const char* GetNameForLogging() override { return "BlocklistThrottle"; }
++
++  ThrottleCheckResult WillStartRequest() override {
++    NavigationHandle* handle = navigation_handle();
++    if (!handle->IsInPrimaryMainFrame())
++      return PROCEED;
++    std::string host(handle->GetURL().host());
++    if (!Blocklist().contains(host) || BlocklistAllowlist().count(host) > 0)
++      return PROCEED;
++
++    blocked_host_ = host;
++#if BUILDFLAG(IS_MAC)
++    ShellPlatformDelegate::RequestBlocklistDecision(
++        handle->GetWebContents(), handle->GetURL(),
++        base::BindOnce(&BlocklistThrottle::OnDecision,
++                       weak_factory_.GetWeakPtr()));
++    return DEFER;
++#else
++    return CANCEL_AND_IGNORE;
++#endif
++  }
++
++ private:
++  void OnDecision(bool proceed) {
++    if (proceed) {
++      BlocklistAllowlist().insert(blocked_host_);
++      Resume();  // Continue the deferred navigation to the (risky) site.
++    } else {
++      CancelDeferredNavigation(CANCEL_AND_IGNORE);
++    }
++  }
++
++  std::string blocked_host_;
++  base::WeakPtrFactory<BlocklistThrottle> weak_factory_{this};
++};
++
+ }  // namespace
+ 
+ void ShellContentBrowserClient::CreateThrottlesForNavigation(
+     NavigationThrottleRegistry& registry) {
++  // Blocklist first, so a dangerous host is stopped before we bother upgrading.
++  registry.AddThrottle(std::make_unique<BlocklistThrottle>(registry));
+   registry.AddThrottle(std::make_unique<HttpsUpgradeThrottle>(registry));
+   if (create_throttles_for_navigation_callback_) {
+     create_throttles_for_navigation_callback_.Run(registry);
+diff --git a/content/shell/browser/shell_platform_delegate.h b/content/shell/browser/shell_platform_delegate.h
+index cc1de57844..121f358af0 100644
+--- a/content/shell/browser/shell_platform_delegate.h
++++ b/content/shell/browser/shell_platform_delegate.h
+@@ -161,6 +161,13 @@ class ShellPlatformDelegate {
+       WebContents* web_contents,
+       const GURL& http_url,
+       base::OnceCallback<void(bool)> callback);
++
++  // Shows a "dangerous site" interstitial for a blocklisted |url| and runs
++  // |callback| with the user's choice (true = visit anyway, false = go back).
++  static void RequestBlocklistDecision(
++      WebContents* web_contents,
++      const GURL& url,
++      base::OnceCallback<void(bool)> callback);
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 3ee0e8ed46..cf90e89f90 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -235,6 +235,9 @@ - (void)presentCertErrorForShell:(content::Shell*)shell
+ - (void)presentHttpFallbackForShell:(content::Shell*)shell
+                                 url:(const GURL&)url
+                           onResolve:(void (^)(BOOL proceed))resolve;
++- (void)presentBlocklistForShell:(content::Shell*)shell
++                             url:(const GURL&)url
++                       onResolve:(void (^)(BOOL proceed))resolve;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1391,6 +1394,40 @@ - (void)presentHttpFallbackForShell:(content::Shell*)shell
+                        }];
+ }
+ 
++// Blocklist ("dangerous site") interstitial. Primary (safe) goes back; secondary
++// visits the site anyway.
++- (void)presentBlocklistForShell:(content::Shell*)shell
++                             url:(const GURL&)url
++                       onResolve:(void (^)(BOOL proceed))resolve {
++  TabNode* tab = shell ? [self tabForShell:shell] : nil;
++  if (!tab) {
++    if (resolve)
++      resolve(NO);
++    return;
++  }
++  NSString* host = base::SysUTF8ToNSString(url.host());
++  NSString* title = @"Dangerous site blocked";
++  NSString* message = [NSString
++      stringWithFormat:@"%@ is on this browser's blocklist of sites known for "
++                       @"malware or phishing. Visiting it could put your device "
++                       @"or information at risk.",
++                       host.length ? host : @"This site"];
++  [self presentInterstitialInTab:tab
++                           title:title
++                         message:message
++                          detail:nil
++                     primaryText:@"Back to safety"
++                   secondaryText:@"Visit anyway (dangerous)"
++                       onPrimary:^{
++                         if (resolve)
++                           resolve(NO);
++                       }
++                     onSecondary:^{
++                         if (resolve)
++                           resolve(YES);
++                       }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2412,6 +2449,24 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+                                       onResolve:resolve];
+ }
+ 
++// static
++void ShellPlatformDelegate::RequestBlocklistDecision(
++    WebContents* web_contents,
++    const GURL& url,
++    base::OnceCallback<void(bool)> callback) {
++  __block base::OnceCallback<void(bool)> cb = std::move(callback);
++  void (^resolve)(BOOL) = ^(BOOL proceed) {
++    if (cb)
++      std::move(cb).Run(proceed);
++  };
++  Shell* shell = Shell::FromWebContents(web_contents);
++  if (!shell || !g_tab_controller) {
++    resolve(NO);
++    return;
++  }
++  [g_tab_controller presentBlocklistForShell:shell url:url onResolve:resolve];
++}
++
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,
+     WebContents* source,
