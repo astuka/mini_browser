@@ -1,0 +1,195 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 72aec5879e..86dfb648bb 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -20,6 +20,8 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -28,6 +30,7 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
++#include "content/shell/browser/shell_content_browser_client.h"
+ #include "ui/gfx/native_ui_types.h"
+ #include "url/gurl.h"
+ 
+@@ -38,6 +41,7 @@
+ // Layout constants (in view coordinates).
+ const CGFloat kButtonWidth = 72;
+ const CGFloat kURLBarHeight = 24;
++const CGFloat kBookmarkBarHeight = 28;
+ const CGFloat kSidebarWidth = 180;
+ const CGFloat kTabRowHeight = 30;
+ const CGFloat kCloseButtonWidth = 24;
+@@ -86,6 +90,9 @@ @interface TabbedShellController : NSObject <NSWindowDelegate> {
+   NSButton* _reloadButton;
+   NSButton* _stopButton;
+   NSTextField* _urlField;
++  NSView* _bookmarkBar;
++  NSButton* _addBookmarkButton;
++  NSMutableArray<NSString*>* _bookmarkURLs;
+   NSMutableArray<TabInfo*>* _tabs;
+   TabInfo* _activeTab;
+   BOOL _closingAll;
+@@ -124,11 +131,13 @@ - (instancetype)initWithContentSize:(NSSize)size {
+     return nil;
+ 
+   _tabs = [[NSMutableArray alloc] init];
++  _bookmarkURLs = [[NSMutableArray alloc] init];
+   _hideToolbar = content::Shell::ShouldHideToolbar();
+ 
+   CGFloat toolbarHeight = _hideToolbar ? 0 : kURLBarHeight;
++  CGFloat bookmarkBarHeight = _hideToolbar ? 0 : kBookmarkBarHeight;
+   CGFloat contentW = kSidebarWidth + size.width;
+-  CGFloat contentH = toolbarHeight + size.height;
++  CGFloat contentH = toolbarHeight + bookmarkBarHeight + size.height;
+ 
+   NSRect contentRect = NSMakeRect(0, 0, contentW, contentH);
+   NSUInteger styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+@@ -208,12 +217,125 @@ - (instancetype)initWithContentSize:(NSSize)size {
+     _urlField.cell.wraps = NO;
+     _urlField.cell.scrollable = YES;
+     [content addSubview:_urlField];
++
++    // Horizontal bookmark bar, between the toolbar and the content area.
++    _bookmarkBar = [[NSView alloc]
++        initWithFrame:NSMakeRect(kSidebarWidth, size.height, size.width,
++                                 kBookmarkBarHeight)];
++    _bookmarkBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
++    [content addSubview:_bookmarkBar];
++
++    // A "+" button pinned to the right of the bar bookmarks the active page.
++    const CGFloat addWidth = 32;
++    _addBookmarkButton = [[NSButton alloc]
++        initWithFrame:NSMakeRect(size.width - addWidth, 0, addWidth,
++                                 kBookmarkBarHeight)];
++    _addBookmarkButton.title = @"+";
++    _addBookmarkButton.bezelStyle = NSBezelStyleSmallSquare;
++    _addBookmarkButton.autoresizingMask = NSViewMinXMargin;
++    _addBookmarkButton.target = self;
++    _addBookmarkButton.action = @selector(addCurrentPageBookmark:);
++    _addBookmarkButton.toolTip = @"Bookmark this page";
++    [_bookmarkBar addSubview:_addBookmarkButton];
++
++    [self rebuildBookmarkBar];
+   }
+ 
+   [_window makeKeyAndOrderFront:nil];
+   return self;
+ }
+ 
++// Rebuilds the bookmark buttons (left side of the bar) from the persisted store,
++// keeping the "+" add button. Each button loads its URL in the active tab.
++- (void)rebuildBookmarkBar {
++  if (!_bookmarkBar)
++    return;
++  for (NSView* v in [_bookmarkBar.subviews copy]) {
++    if (v != _addBookmarkButton)
++      [v removeFromSuperview];
++  }
++  [_bookmarkURLs removeAllObjects];
++
++  base::DictValue bookmarks =
++      content::ShellContentBrowserClient::Get()->GetBookmarks();
++  const base::ListValue* roots = bookmarks.FindList("roots");
++  if (!roots)
++    return;
++
++  CGFloat x = 4;
++  int idx = 0;
++  for (const base::Value& item : *roots) {
++    const base::DictValue* d = item.GetIfDict();
++    if (!d)
++      continue;
++    const std::string* type = d->FindString("type");
++    if (type && *type != "bookmark")
++      continue;  // Folders aren't rendered yet.
++    const std::string* url = d->FindString("url");
++    if (!url || url->empty())
++      continue;
++    const std::string* title = d->FindString("title");
++    NSString* label = base::SysUTF8ToNSString(
++        (title && !title->empty()) ? *title : *url);
++
++    NSButton* button = [[NSButton alloc]
++        initWithFrame:NSMakeRect(x, 0, 10, kBookmarkBarHeight)];
++    button.title = label;
++    button.bordered = NO;
++    button.cell.lineBreakMode = NSLineBreakByTruncatingTail;
++    button.target = self;
++    button.action = @selector(bookmarkClicked:);
++    button.tag = idx;
++    [button sizeToFit];
++    NSRect f = button.frame;
++    f.origin.x = x;
++    f.origin.y = 0;
++    f.size.height = kBookmarkBarHeight;
++    f.size.width = std::min(NSWidth(f), CGFloat{160});
++    button.frame = f;
++    [_bookmarkBar addSubview:button];
++    [_bookmarkURLs addObject:base::SysUTF8ToNSString(*url)];
++
++    x += NSWidth(f) + 4;
++    idx++;
++  }
++}
++
++- (void)bookmarkClicked:(id)sender {
++  NSInteger idx = [sender tag];
++  if (idx < 0 || idx >= static_cast<NSInteger>(_bookmarkURLs.count))
++    return;
++  content::Shell* shell = [self activeShell];
++  if (!shell)
++    return;
++  shell->LoadURL(GURL(base::SysNSStringToUTF8(_bookmarkURLs[idx])));
++}
++
++- (void)addCurrentPageBookmark:(id)sender {
++  content::Shell* shell = [self activeShell];
++  if (!shell)
++    return;
++  GURL url = shell->web_contents()->GetLastCommittedURL();
++  if (url.is_empty())
++    return;
++  std::string title = base::UTF16ToUTF8(shell->web_contents()->GetTitle());
++
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue bookmarks = client->GetBookmarks();
++  if (!bookmarks.contains("version"))
++    bookmarks.Set("version", 1);
++  base::ListValue* roots = bookmarks.EnsureList("roots");
++  base::DictValue entry;
++  entry.Set("type", "bookmark");
++  entry.Set("title", title);
++  entry.Set("url", url.spec());
++  roots->Append(std::move(entry));
++  client->SetBookmarks(std::move(bookmarks));
++
++  [self rebuildBookmarkBar];
++}
++
+ - (NSButton*)makeToolbarButton:(NSString*)title
+                          frame:(NSRect)frame
+                            tag:(int)tag
+@@ -575,10 +697,11 @@ - (BOOL)windowShouldClose:(id)sender {
+ void ShellPlatformDelegate::ResizeWebContent(Shell* shell,
+                                              const gfx::Size& content_size) {
+   // Resize the shared window's content area to fit the requested web size plus
+-  // the sidebar and toolbar chrome.
+-  int toolbar_height = Shell::ShouldHideToolbar() ? 0 : kURLBarHeight;
++  // the sidebar, toolbar, and bookmark-bar chrome.
++  int chrome_height =
++      Shell::ShouldHideToolbar() ? 0 : (kURLBarHeight + kBookmarkBarHeight);
+   NSSize new_size = NSMakeSize(content_size.width() + kSidebarWidth,
+-                               content_size.height() + toolbar_height);
++                               content_size.height() + chrome_height);
+   [g_tab_controller.window setContentSize:new_size];
+ }
+ 

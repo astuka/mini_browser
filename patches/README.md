@@ -25,6 +25,12 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `PrefService`/`Local State`, avoiding `//components/bookmarks`). Touches
   `content/shell/browser/shell_content_browser_client.{cc,h}` — an *independent* patch (different
   files from `0001`/`0002`). Backing store for the upcoming bookmark bar.
+- **`0004-bookmark-bar.patch`** — a **horizontal bookmark bar** between the toolbar and the
+  content area: renders a button per stored bookmark (click loads it in the active tab) plus a
+  "+" button that bookmarks the current page (title + URL) and persists it via the `0003` store.
+  Adds a `layoutChrome`-style band (`kBookmarkBarHeight`) and updates `ResizeWebContent`. Touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`**; it
+  also depends on `0003`'s `GetBookmarks/SetBookmarks` accessor at runtime.
 
 ## Workflow
 
