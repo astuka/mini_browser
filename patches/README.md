@@ -69,6 +69,15 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   request a copy — tab→tab stays a Move (the row destination still returns Move). Touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
   `0005`/`0006`/`0007`** (uses the `0003` store; reuses the `0006` row-drag pasteboard type).
+- **`0009-rename-folders.patch`** — **rename tab folders**. Adds a "Rename Folder…" item to the
+  `0007` folder context menu (and double-click on a folder row) that overlays an inline
+  `NSTextField` editor on the folder's row, seeded with the current name. Return / clicking away
+  commits (empty falls back to "Folder"); Esc cancels. The disclosure triangle and live tab count
+  are preserved (only the name is editable, stored in `TabNode.folderTitle`). The editor's commit
+  delegate is wired one runloop tick after it takes focus, to skip a spurious end-editing AppKit
+  emits while the field is *becoming* first responder. Closes out the tab-structure epic. Touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
+  `0005`/`0006`/`0007`/`0008`** (extends the `0007` context menu).
 
 ## Workflow
 
