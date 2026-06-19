@@ -1,0 +1,647 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 22fc422aac..a2971e2c8f 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -14,6 +14,7 @@
+ #import <Cocoa/Cocoa.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ 
+ #import "base/apple/foundation_util.h"
+ #include "base/check_op.h"
+@@ -45,6 +46,11 @@
+ const CGFloat kSidebarWidth = 180;
+ const CGFloat kTabRowHeight = 30;
+ const CGFloat kCloseButtonWidth = 24;
++// Horizontal indent per tree level, so a folder's tabs sit under the folder.
++const CGFloat kIndent = 16;
++// Minimum cursor travel (points) before a press on a tab row becomes a drag
++// rather than a click.
++const CGFloat kDragThreshold = 5;
+ 
+ // The minimum size of the window's content (in view coordinates).
+ const CGFloat kMinimumWindowWidth = 600;
+@@ -52,6 +58,33 @@
+ 
+ }  // namespace
+ 
++// Drag pasteboard type for a tab/folder row dragged within the strip. The drag
++// payload is held in the controller (the dragged TabNode); this type only marks
++// the drag as "one of our rows" so destinations can opt in. A later feature
++// (drag tab -> bookmark bar) reuses this same type from a different destination.
++static NSString* const kTabRowPasteboardType = @"com.contentshell.tabrow";
++
++@class TabbedShellController;
++@class TabNode;
++
++// A sidebar row container that is both a drag SOURCE (the row can be picked up
++// and dropped onto another row to build a folder) and a drag DESTINATION (a row
++// accepts another row dropped onto it). All decisions are delegated to the
++// controller, which owns the tab tree.
++@interface TabRowView : NSView <NSDraggingSource, NSDraggingDestination>
++@property(weak) TabbedShellController* controller;
++@property(weak) TabNode* node;
++@end
++
++// The row's title control. It looks and lays out like the old plain button, but
++// distinguishes a click (activate the tab / toggle a folder) from a drag (begin
++// a row drag) by tracking the mouse itself, so dragging works even though the
++// button sits on top of the draggable row.
++@interface TabTitleButton : NSButton
++@property(weak) TabbedShellController* controller;
++@property(weak) TabNode* node;
++@end
++
+ // A view whose coordinate origin is the top-left, so the tab strip stacks
+ // downward naturally.
+ @interface FlippedView : NSView
+@@ -111,6 +144,9 @@ @interface TabbedShellController : NSObject <NSWindowDelegate> {
+   NSMutableArray<TabNode*>* _tabs;       // Top-level nodes (roots of the tree).
+   NSMutableArray<TabNode*>* _flatRows;   // Derived render order (DFS of _tabs).
+   TabNode* _activeTab;
++  __weak TabNode* _draggingNode;         // The row currently being dragged.
++  __weak TabNode* _dropTargetNode;       // The row currently highlighted as a
++                                         // drop target.
+   BOOL _closingAll;
+   BOOL _hideToolbar;
+   // When set, the next tab created is brought to the foreground (used by the
+@@ -131,6 +167,13 @@ - (void)setEnabled:(BOOL)enabled
+        forControlId:(int)controlId
+               shell:(content::Shell*)shell;
+ - (void)focusURLField;
++// Row interaction, called from TabRowView / TabTitleButton:
++- (void)rowClicked:(TabNode*)node;
++- (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event;
++- (NSDragOperation)dragOverNode:(TabNode*)target;
++- (void)dragExitedNode:(TabNode*)target;
++- (BOOL)performDropOnNode:(TabNode*)target;
++- (void)dragSessionEnded;
+ @end
+ 
+ namespace {
+@@ -418,18 +461,154 @@ - (void)appendFlatRows:(NSArray<TabNode*>*)nodes {
+ 
+ - (void)layoutTabRows {
+   [self rebuildFlatRows];
++  // Hide every row, then show only those in the visible (flat) order, so the
++  // rows of collapsed folders' children don't linger on screen.
++  for (TabNode* node in [self allNodes])
++    node->rowView.hidden = YES;
++
+   _newTabButton.frame = NSMakeRect(0, 0, kSidebarWidth, kTabRowHeight);
+   CGFloat y = kTabRowHeight;
+   for (TabNode* node in _flatRows) {
++    node->rowView.hidden = NO;
+     node->rowView.frame = NSMakeRect(0, y, kSidebarWidth, kTabRowHeight);
+-    node->titleButton.frame =
+-        NSMakeRect(0, 0, kSidebarWidth - kCloseButtonWidth, kTabRowHeight);
+-    node->closeButton.frame = NSMakeRect(kSidebarWidth - kCloseButtonWidth, 0,
+-                                         kCloseButtonWidth, kTabRowHeight);
++    CGFloat indent = [self depthOf:node] * kIndent;
++    if (node->kind == TabNodeKindFolder) {
++      // Folders have no close button; the title spans the rest of the row.
++      node->titleButton.frame =
++          NSMakeRect(indent, 0, kSidebarWidth - indent, kTabRowHeight);
++    } else {
++      node->titleButton.frame = NSMakeRect(
++          indent, 0, kSidebarWidth - indent - kCloseButtonWidth, kTabRowHeight);
++      node->closeButton.frame = NSMakeRect(kSidebarWidth - kCloseButtonWidth, 0,
++                                           kCloseButtonWidth, kTabRowHeight);
++    }
+     y += kTabRowHeight;
+   }
+ }
+ 
++// --- Tree helpers ----------------------------------------------------------
++
++// Every node in the tree, pre-order (includes folders and collapsed children).
++- (NSArray<TabNode*>*)allNodes {
++  NSMutableArray<TabNode*>* out = [NSMutableArray array];
++  [self collectNodes:_tabs into:out];
++  return out;
++}
++
++- (void)collectNodes:(NSArray<TabNode*>*)nodes
++                into:(NSMutableArray<TabNode*>*)out {
++  for (TabNode* node in nodes) {
++    [out addObject:node];
++    if (node->children)
++      [self collectNodes:node->children into:out];
++  }
++}
++
++- (NSInteger)depthOf:(TabNode*)node {
++  NSInteger depth = 0;
++  for (TabNode* p = node->parent; p; p = p->parent)
++    ++depth;
++  return depth;
++}
++
++- (BOOL)node:(TabNode*)node isDescendantOf:(TabNode*)ancestor {
++  for (TabNode* p = node; p; p = p->parent)
++    if (p == ancestor)
++      return YES;
++  return NO;
++}
++
++// Detaches a node from wherever it currently lives (a folder's children, or the
++// top-level roots), clearing its parent. Does not touch its row view.
++- (void)detachNode:(TabNode*)node {
++  NSMutableArray<TabNode*>* container = node->parent ? node->parent->children
++                                                     : _tabs;
++  [container removeObject:node];
++  node->parent = nil;
++}
++
++// Keeps folders meaningful: a folder with 2+ children just refreshes its label;
++// a folder that has dropped to 0 or 1 children is dissolved, with any lone
++// survivor lifted up into the folder's old position. Recurses upward, since
++// lifting a survivor can in turn empty a grandparent folder.
++- (void)pruneFolder:(TabNode*)folder {
++  if (!folder || folder->kind != TabNodeKindFolder)
++    return;
++  if (folder->children.count >= 2) {
++    [self updateFolderTitle:folder];
++    return;
++  }
++  NSMutableArray<TabNode*>* container = folder->parent ? folder->parent->children
++                                                       : _tabs;
++  NSUInteger at = [container indexOfObject:folder];
++  if (at == NSNotFound)
++    at = container.count;
++  TabNode* grand = folder->parent;
++  for (TabNode* child in [folder->children copy]) {
++    [container insertObject:child atIndex:at++];
++    child->parent = grand;
++  }
++  [folder->children removeAllObjects];
++  [container removeObject:folder];
++  [folder->rowView removeFromSuperview];
++  if (grand)
++    [self pruneFolder:grand];
++}
++
++// Builds a new (empty, expanded) folder node with its sidebar row.
++- (TabNode*)makeFolderNode {
++  TabNode* folder = [[TabNode alloc] init];
++  folder->kind = TabNodeKindFolder;
++  folder->children = [[NSMutableArray alloc] init];
++  folder->expanded = YES;
++  folder->folderTitle = @"Folder";
++
++  TabRowView* row = [[TabRowView alloc] initWithFrame:NSZeroRect];
++  row.wantsLayer = YES;
++  row.controller = self;
++  row.node = folder;
++  [row registerForDraggedTypes:@[ kTabRowPasteboardType ]];
++  folder->rowView = row;
++
++  TabTitleButton* title = [[TabTitleButton alloc] initWithFrame:NSZeroRect];
++  title.bordered = NO;
++  title.alignment = NSTextAlignmentLeft;
++  title.cell.lineBreakMode = NSLineBreakByTruncatingTail;
++  title.controller = self;
++  title.node = folder;
++  [row addSubview:title];
++  folder->titleButton = title;
++
++  return folder;
++}
++
++// Folder label shows a disclosure triangle, the name, and the tab count.
++- (void)updateFolderTitle:(TabNode*)folder {
++  if (!folder || folder->kind != TabNodeKindFolder)
++    return;
++  NSString* triangle = folder->expanded ? @"▾" : @"▸";  // ▾ / ▸
++  NSString* name = folder->folderTitle.length ? folder->folderTitle : @"Folder";
++  folder->titleButton.title =
++      [NSString stringWithFormat:@"%@ %@ (%lu)", triangle, name,
++                                 (unsigned long)folder->children.count];
++}
++
++// Single place that decides a row's background: drop-target highlight wins, then
++// the active-tab highlight, else transparent. (A future multi-select state will
++// slot in here too.)
++- (void)restyleRow:(TabNode*)node {
++  if (!node->rowView.wantsLayer)
++    return;
++  NSColor* color;
++  if (node == _dropTargetNode)
++    color = [NSColor.controlAccentColor colorWithAlphaComponent:0.5];
++  else if (node == _activeTab)
++    color = NSColor.selectedControlColor;
++  else
++    color = NSColor.clearColor;
++  node->rowView.layer.backgroundColor = color.CGColor;
++}
++
+ - (TabNode*)tabForShell:(content::Shell*)shell {
+   return [self findShell:shell in:_tabs];
+ }
+@@ -471,17 +650,22 @@ - (void)addTabForShell:(content::Shell*)shell {
+   TabNode* tab = [[TabNode alloc] init];
+   tab->shell = shell;
+ 
+-  tab->rowView = [[NSView alloc] initWithFrame:NSZeroRect];
+-  tab->rowView.wantsLayer = YES;
+-
+-  tab->titleButton = [[NSButton alloc] initWithFrame:NSZeroRect];
+-  tab->titleButton.title = @"New Tab";
+-  tab->titleButton.bordered = NO;
+-  tab->titleButton.alignment = NSTextAlignmentLeft;
+-  tab->titleButton.cell.lineBreakMode = NSLineBreakByTruncatingTail;
+-  tab->titleButton.target = self;
+-  tab->titleButton.action = @selector(tabClicked:);
+-  [tab->rowView addSubview:tab->titleButton];
++  TabRowView* row = [[TabRowView alloc] initWithFrame:NSZeroRect];
++  row.wantsLayer = YES;
++  row.controller = self;
++  row.node = tab;
++  [row registerForDraggedTypes:@[ kTabRowPasteboardType ]];
++  tab->rowView = row;
++
++  TabTitleButton* title = [[TabTitleButton alloc] initWithFrame:NSZeroRect];
++  title.title = @"New Tab";
++  title.bordered = NO;
++  title.alignment = NSTextAlignmentLeft;
++  title.cell.lineBreakMode = NSLineBreakByTruncatingTail;
++  title.controller = self;
++  title.node = tab;
++  [tab->rowView addSubview:title];
++  tab->titleButton = title;
+ 
+   tab->closeButton = [[NSButton alloc] initWithFrame:NSZeroRect];
+   tab->closeButton.title = @"×";  // multiplication sign as a close glyph
+@@ -547,25 +731,37 @@ - (void)attachContentsForShell:(content::Shell*)shell {
+ }
+ 
+ - (void)activateTab:(TabNode*)tab {
+-  if (!tab || tab == _activeTab)
++  if (!tab || tab == _activeTab || tab->kind != TabNodeKindTab)
+     return;
+ 
+-  if (_activeTab) {
+-    _activeTab->webView.hidden = YES;
+-    if (_activeTab->shell)
+-      _activeTab->shell->web_contents()->WasHidden();
+-    _activeTab->rowView.layer.backgroundColor = NSColor.clearColor.CGColor;
++  // Make sure the tab is reachable: expand any collapsed ancestor folders.
++  BOOL layoutChanged = NO;
++  for (TabNode* p = tab->parent; p; p = p->parent) {
++    if (!p->expanded) {
++      p->expanded = YES;
++      [self updateFolderTitle:p];
++      layoutChanged = YES;
++    }
++  }
++
++  TabNode* prev = _activeTab;
++  if (prev) {
++    prev->webView.hidden = YES;
++    if (prev->shell)
++      prev->shell->web_contents()->WasHidden();
+   }
+ 
+   _activeTab = tab;
++  if (prev)
++    [self restyleRow:prev];
++
+   tab->webView.hidden = NO;
+   [tab->webView.superview addSubview:tab->webView
+                           positioned:NSWindowAbove
+                           relativeTo:nil];
+   if (tab->shell)
+     tab->shell->web_contents()->WasShown();
+-  tab->rowView.layer.backgroundColor =
+-      NSColor.selectedControlColor.CGColor;
++  [self restyleRow:tab];
+ 
+   // Retarget the toolbar to the newly active tab.
+   if (!_hideToolbar && tab->shell) {
+@@ -574,6 +770,9 @@ - (void)activateTab:(TabNode*)tab {
+     _window.title = tab->titleButton.title.length ? tab->titleButton.title
+                                                   : kWindowTitle;
+   }
++
++  if (layoutChanged)
++    [self layoutTabRows];
+ }
+ 
+ - (void)removeTabForShell:(content::Shell*)shell {
+@@ -583,19 +782,26 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   if (!tab)
+     return;
+ 
+-  NSUInteger index = [_tabs indexOfObject:tab];
++  // Remember where this row sat in the visible order so we can pick a sensible
++  // neighbor to activate next.
++  [self rebuildFlatRows];
++  NSUInteger flatIndex = [_flatRows indexOfObject:tab];
++  if (flatIndex == NSNotFound)
++    flatIndex = 0;
++
+   [tab->webView removeFromSuperview];
+   [tab->rowView removeFromSuperview];
+   tab->shell = nullptr;
+-  [_tabs removeObject:tab];
++  TabNode* oldParent = tab->parent;
++  [self detachNode:tab];
++  if (oldParent)
++    [self pruneFolder:oldParent];  // May dissolve an emptied folder.
+ 
+   if (tab == _activeTab) {
+     _activeTab = nil;
+-    if (_tabs.count > 0) {
+-      NSUInteger next = std::min(static_cast<NSUInteger>(index),
+-                                 static_cast<NSUInteger>(_tabs.count - 1));
+-      [self activateTab:_tabs[next]];
+-    }
++    TabNode* next = [self nextActiveTabNear:flatIndex];
++    if (next)
++      [self activateTab:next];
+   }
+   [self layoutTabRows];
+ 
+@@ -608,6 +814,19 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   }
+ }
+ 
++// Picks the tab to activate after a removal: the first tab at/after the closed
++// row's old position in the visible order, else the nearest one before it.
++- (TabNode*)nextActiveTabNear:(NSUInteger)flatIndex {
++  [self rebuildFlatRows];
++  for (NSUInteger i = flatIndex; i < _flatRows.count; ++i)
++    if (_flatRows[i]->kind == TabNodeKindTab)
++      return _flatRows[i];
++  for (NSInteger i = static_cast<NSInteger>(flatIndex) - 1; i >= 0; --i)
++    if (_flatRows[i]->kind == TabNodeKindTab)
++      return _flatRows[i];
++  return nil;
++}
++
+ - (void)setURLString:(NSString*)s forShell:(content::Shell*)shell {
+   if (_hideToolbar)
+     return;
+@@ -672,28 +891,149 @@ - (void)newTab:(id)sender {
+                                   content::Shell::GetShellDefaultSize());
+ }
+ 
+-- (void)tabClicked:(id)sender {
+-  for (TabNode* tab in _tabs) {
+-    if (tab->titleButton == sender) {
+-      [self activateTab:tab];
+-      if (tab->shell)
+-        tab->shell->web_contents()->Focus();
+-      return;
+-    }
++// A plain click on a row: a folder toggles open/closed; a tab is activated.
++- (void)rowClicked:(TabNode*)node {
++  if (!node)
++    return;
++  if (node->kind == TabNodeKindFolder) {
++    node->expanded = !node->expanded;
++    [self updateFolderTitle:node];
++    [self layoutTabRows];
++    return;
+   }
++  [self activateTab:node];
++  if (node->shell)
++    node->shell->web_contents()->Focus();
+ }
+ 
+ - (void)closeTabButton:(id)sender {
+-  for (TabNode* tab in _tabs) {
+-    if (tab->closeButton == sender) {
+-      content::Shell* shell = tab->shell;
+-      // Close() deletes the Shell, which calls back into removeTabForShell:.
+-      // Do not touch `sender` or `tab` after this point.
+-      if (shell)
+-        shell->Close();
+-      return;
++  TabNode* tab = [self tabForCloseButton:sender in:_tabs];
++  // Close() deletes the Shell, which calls back into removeTabForShell:.
++  // Do not touch `sender` or `tab` after this point.
++  if (tab && tab->shell)
++    tab->shell->Close();
++}
++
++- (TabNode*)tabForCloseButton:(id)button in:(NSArray<TabNode*>*)nodes {
++  for (TabNode* node in nodes) {
++    if (node->closeButton == button)
++      return node;
++    if (node->children) {
++      TabNode* found = [self tabForCloseButton:button in:node->children];
++      if (found)
++        return found;
+     }
+   }
++  return nil;
++}
++
++// --- Drag & drop -----------------------------------------------------------
++
++- (void)beginDragForNode:(TabNode*)node withEvent:(NSEvent*)event {
++  if (!node)
++    return;
++  _draggingNode = node;
++
++  NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
++  [item setString:@"row" forType:kTabRowPasteboardType];
++  NSDraggingItem* dragItem =
++      [[NSDraggingItem alloc] initWithPasteboardWriter:item];
++
++  // Drag image: a snapshot of the row being dragged.
++  NSView* row = node->rowView;
++  NSRect bounds = row.bounds;
++  NSBitmapImageRep* rep = [row bitmapImageRepForCachingDisplayInRect:bounds];
++  [row cacheDisplayInRect:bounds toBitmapImageRep:rep];
++  NSImage* image = [[NSImage alloc] initWithSize:bounds.size];
++  [image addRepresentation:rep];
++  [dragItem setDraggingFrame:bounds contents:image];
++
++  [(TabRowView*)row beginDraggingSessionWithItems:@[ dragItem ]
++                                            event:event
++                                           source:(TabRowView*)row];
++}
++
++// Whether the in-flight drag can drop on `target`, and the highlight that goes
++// with it. Disallows dropping onto itself or into its own subtree.
++- (NSDragOperation)dragOverNode:(TabNode*)target {
++  if (!_draggingNode || !target || target == _draggingNode)
++    return NSDragOperationNone;
++  if ([self node:target isDescendantOf:_draggingNode])
++    return NSDragOperationNone;
++  if (_dropTargetNode != target) {
++    TabNode* prev = _dropTargetNode;
++    _dropTargetNode = target;
++    if (prev)
++      [self restyleRow:prev];
++    [self restyleRow:target];
++  }
++  return NSDragOperationMove;
++}
++
++- (void)dragExitedNode:(TabNode*)target {
++  if (_dropTargetNode == target) {
++    _dropTargetNode = nil;
++    [self restyleRow:target];
++  }
++}
++
++// Drop a row onto `target`. Onto a folder: move in. Onto a tab already in a
++// folder: join that folder next to it. Onto a top-level tab: create a new
++// folder holding both. Empties left behind in the source's old folder are
++// pruned.
++- (BOOL)performDropOnNode:(TabNode*)target {
++  TabNode* src = _draggingNode;
++  if (!src || !target || src == target)
++    return NO;
++  if ([self node:target isDescendantOf:src])
++    return NO;
++
++  TabNode* oldParent = src->parent;
++  TabNode* folder = nil;
++
++  if (target->kind == TabNodeKindFolder) {
++    folder = target;
++    [self detachNode:src];
++    [folder->children addObject:src];
++    src->parent = folder;
++  } else if (target->parent) {
++    folder = target->parent;
++    [self detachNode:src];
++    NSUInteger ti = [folder->children indexOfObject:target];
++    NSUInteger at = (ti == NSNotFound) ? folder->children.count : ti + 1;
++    [folder->children insertObject:src atIndex:at];
++    src->parent = folder;
++  } else {
++    // Top-level tab: wrap target and src in a new folder at target's slot.
++    // Detach src first so target's index reflects the post-removal positions.
++    folder = [self makeFolderNode];
++    [self detachNode:src];
++    NSUInteger ti = [_tabs indexOfObject:target];
++    if (ti == NSNotFound)
++      ti = _tabs.count;
++    [_tabs removeObject:target];
++    [_tabs insertObject:folder atIndex:ti];
++    [_sidebar addSubview:folder->rowView];
++    target->parent = folder;
++    src->parent = folder;
++    [folder->children addObject:target];
++    [folder->children addObject:src];
++  }
++
++  folder->expanded = YES;
++  if (oldParent && oldParent != folder)
++    [self pruneFolder:oldParent];
++  [self updateFolderTitle:folder];
++  [self layoutTabRows];
++  return YES;
++}
++
++- (void)dragSessionEnded {
++  TabNode* prev = _dropTargetNode;
++  _dropTargetNode = nil;
++  _draggingNode = nil;
++  if (prev)
++    [self restyleRow:prev];
+ }
+ 
+ // --- NSWindowDelegate ------------------------------------------------------
+@@ -702,20 +1042,91 @@ - (BOOL)windowShouldClose:(id)sender {
+   // Closing the window closes every tab. Close()->~Shell()->removeTabForShell:
+   // is suppressed by _closingAll so we can tear down deterministically here.
+   _closingAll = YES;
+-  NSArray<TabNode*>* snapshot = [_tabs copy];
+-  for (TabNode* tab in snapshot) {
+-    content::Shell* shell = tab->shell;
+-    tab->shell = nullptr;
++  for (TabNode* node in [self allNodes]) {
++    if (node->kind != TabNodeKindTab)
++      continue;
++    content::Shell* shell = node->shell;
++    node->shell = nullptr;
+     if (shell)
+       shell->Close();  // -> delete Shell -> last one fires Shell::Shutdown().
+   }
+   [_tabs removeAllObjects];
++  [_flatRows removeAllObjects];
+   _window.delegate = nil;
+   return YES;
+ }
+ 
+ @end
+ 
++@implementation TabRowView
++
++@synthesize controller = _controller;
++@synthesize node = _node;
++
++// Source: rows can be moved (to form/join folders).
++- (NSDragOperation)draggingSession:(NSDraggingSession*)session
++    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
++  return NSDragOperationMove;
++}
++
++- (void)draggingSession:(NSDraggingSession*)session
++           endedAtPoint:(NSPoint)screenPoint
++              operation:(NSDragOperation)operation {
++  [self.controller dragSessionEnded];
++}
++
++// Destination: forward all decisions to the controller, which owns the tree.
++- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
++  return [self.controller dragOverNode:self.node];
++}
++
++- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
++  return [self.controller dragOverNode:self.node];
++}
++
++- (void)draggingExited:(id<NSDraggingInfo>)sender {
++  [self.controller dragExitedNode:self.node];
++}
++
++- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
++  return YES;
++}
++
++- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
++  return [self.controller performDropOnNode:self.node];
++}
++
++@end
++
++@implementation TabTitleButton
++
++@synthesize controller = _controller;
++@synthesize node = _node;
++
++// Distinguish a click from a drag by tracking the mouse: travel past the
++// threshold starts a row drag; a release without travel is a click. (We can't
++// rely on the button's normal action, because the row underneath needs the
++// drag.)
++- (void)mouseDown:(NSEvent*)event {
++  NSPoint start = event.locationInWindow;
++  while (true) {
++    NSEvent* next =
++        [self.window nextEventMatchingMask:(NSEventMaskLeftMouseUp |
++                                            NSEventMaskLeftMouseDragged)];
++    if (!next || next.type == NSEventTypeLeftMouseUp) {
++      [self.controller rowClicked:self.node];
++      return;
++    }
++    NSPoint p = next.locationInWindow;
++    if (std::hypot(p.x - start.x, p.y - start.y) > kDragThreshold) {
++      [self.controller beginDragForNode:self.node withEvent:next];
++      return;
++    }
++  }
++}
++
++@end
++
+ namespace content {
+ 
+ // These are required by the header (it declares the members), but the tab
