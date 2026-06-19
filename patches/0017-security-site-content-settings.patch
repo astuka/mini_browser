@@ -1,0 +1,210 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 18a9f3f8f4..2032dcdb38 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -59,6 +59,7 @@
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/navigation_throttle.h"
+ #include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/network_service_instance.h"
+ #include "content/public/browser/page_navigator.h"
+ #include "content/public/common/referrer.h"
+@@ -643,6 +644,15 @@ void ShellContentBrowserClient::OverrideWebPreferences(
+     prefs->in_forced_colors = false;
+     prefs->preferred_contrast = blink::mojom::PreferredContrast::kNoPreference;
+   }
++
++  // Per-site JavaScript toggle from the SiteSettings store (S7). Absent = on.
++  if (web_contents && web_contents->GetPrimaryMainFrame()) {
++    std::string origin =
++        web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin().Serialize();
++    std::optional<bool> js_enabled = GetSitePermission(origin, "javascript");
++    if (js_enabled.has_value() && !js_enabled.value())
++      prefs->javascript_enabled = false;
++  }
+ }
+ 
+ std::unique_ptr<content::DevToolsManagerDelegate>
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index e315ff423b..0537fb72dc 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -32,6 +32,7 @@
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/ssl_status.h"
++#include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+@@ -40,7 +41,9 @@
+ #include "net/cert/cert_status_flags.h"
+ #include "net/cert/x509_cert_types.h"
+ #include "net/cert/x509_certificate.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
+ #include "ui/gfx/native_ui_types.h"
++#include "url/origin.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -1099,26 +1102,57 @@ - (void)refreshSecurityIndicator {
+ 
+ // --- Actions ---------------------------------------------------------------
+ 
+-// Click the indicator → toggle a popover summarizing the connection + (for
+-// HTTPS) the server certificate, read straight from the navigation's SSLStatus.
++// Click the indicator → toggle a site-info popover: the connection/certificate
++// summary plus interactive site controls (per-site JavaScript, global
++// third-party-cookie blocking).
+ - (void)securityIndicatorClicked:(id)sender {
+   if (_certPopover && _certPopover.shown) {
+     [_certPopover close];
+     return;
+   }
+ 
++  const CGFloat pad = 12;
++  const CGFloat width = 360;
++
+   NSTextField* label =
+       [NSTextField wrappingLabelWithString:[self securityDetailText]];
+   label.selectable = YES;
+-  label.preferredMaxLayoutWidth = 360;
+-  [label sizeToFit];
++  label.preferredMaxLayoutWidth = width;
++  NSSize labelSize = [label sizeThatFits:NSMakeSize(width, CGFLOAT_MAX)];
++
++  BOOL showJS = [self activeTabHasWebOrigin];
++  const CGFloat rowH = 22;
++  const CGFloat gap = 12;
++  CGFloat total = pad + labelSize.height + gap + (showJS ? rowH : 0) + rowH + pad;
+ 
+-  NSRect lf = label.frame;
+   NSView* content = [[NSView alloc]
+-      initWithFrame:NSMakeRect(0, 0, NSWidth(lf) + 24, NSHeight(lf) + 24)];
+-  label.frame = NSMakeRect(12, 12, NSWidth(lf), NSHeight(lf));
++      initWithFrame:NSMakeRect(0, 0, width + 2 * pad, total)];
++
++  label.frame = NSMakeRect(pad, total - pad - labelSize.height, width,
++                           labelSize.height);
+   [content addSubview:label];
+ 
++  CGFloat y = total - pad - labelSize.height - gap;
++  if (showJS) {
++    NSButton* jsBox =
++        [NSButton checkboxWithTitle:@"Enable JavaScript on this site"
++                             target:self
++                             action:@selector(toggleSiteJavaScript:)];
++    jsBox.state = [self javaScriptEnabledForActiveTab] ? NSControlStateValueOn
++                                                       : NSControlStateValueOff;
++    jsBox.frame = NSMakeRect(pad, y - rowH, width, rowH);
++    [content addSubview:jsBox];
++    y -= rowH;
++  }
++  NSButton* cookieBox =
++      [NSButton checkboxWithTitle:@"Block third-party cookies (all sites)"
++                           target:self
++                           action:@selector(toggleThirdPartyCookies:)];
++  cookieBox.state = [self thirdPartyCookiesBlocked] ? NSControlStateValueOn
++                                                    : NSControlStateValueOff;
++  cookieBox.frame = NSMakeRect(pad, y - rowH, width, rowH);
++  [content addSubview:cookieBox];
++
+   NSViewController* vc = [[NSViewController alloc] init];
+   vc.view = content;
+   _certPopover = [[NSPopover alloc] init];
+@@ -1129,6 +1163,76 @@ - (void)securityIndicatorClicked:(id)sender {
+                          preferredEdge:NSRectEdgeMaxY];
+ }
+ 
++// --- Site settings (S7) ----------------------------------------------------
++
++// The active tab's origin key, or empty for internal pages (no http/https).
++- (std::string)activeOriginKey {
++  content::Shell* shell = [self activeShell];
++  if (!shell)
++    return std::string();
++  GURL url = shell->web_contents()->GetLastCommittedURL();
++  if (!url.SchemeIs("http") && !url.SchemeIsCryptographic())
++    return std::string();
++  return url::Origin::Create(url).Serialize();
++}
++
++- (BOOL)activeTabHasWebOrigin {
++  return ![self activeOriginKey].empty();
++}
++
++- (BOOL)javaScriptEnabledForActiveTab {
++  std::string origin = [self activeOriginKey];
++  if (origin.empty())
++    return YES;
++  std::optional<bool> js =
++      content::ShellContentBrowserClient::Get()->GetSitePermission(origin,
++                                                                   "javascript");
++  return js.value_or(true);
++}
++
++- (void)toggleSiteJavaScript:(id)sender {
++  content::Shell* shell = [self activeShell];
++  std::string origin = [self activeOriginKey];
++  if (!shell || origin.empty())
++    return;
++  BOOL enabled = ([sender state] == NSControlStateValueOn);
++  content::ShellContentBrowserClient::Get()->SetSitePermission(
++      origin, "javascript", enabled);
++  // Re-apply WebPreferences and reload so the change takes effect on the page.
++  shell->web_contents()->OnWebPreferencesChanged();
++  shell->web_contents()->GetController().Reload(content::ReloadType::NORMAL,
++                                                false);
++  if (_certPopover)
++    [_certPopover close];
++}
++
++- (BOOL)thirdPartyCookiesBlocked {
++  return content::ShellContentBrowserClient::Get()
++      ->GetSitePermission("*", "block_third_party_cookies")
++      .value_or(false);
++}
++
++- (void)toggleThirdPartyCookies:(id)sender {
++  BOOL block = ([sender state] == NSControlStateValueOn);
++  content::ShellContentBrowserClient::Get()->SetSitePermission(
++      "*", "block_third_party_cookies", block);
++  [self applyThirdPartyCookieBlocking:block];
++  if (_certPopover)
++    [_certPopover close];
++}
++
++// Pushes the third-party-cookie setting to the network service's cookie manager.
++- (void)applyThirdPartyCookieBlocking:(BOOL)block {
++  content::Shell* shell = [self activeShell];
++  if (!shell)
++    return;
++  shell->web_contents()
++      ->GetBrowserContext()
++      ->GetDefaultStoragePartition()
++      ->GetCookieManagerForBrowserProcess()
++      ->BlockThirdPartyCookies(block);
++}
++
+ - (NSString*)formatCertTime:(base::Time)time {
+   base::Time::Exploded exploded;
+   time.UTCExplode(&exploded);
+@@ -2347,6 +2451,17 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+     dispatch_async(dispatch_get_main_queue(), ^{
+       [controller restoreSessionWithPlaceholder:shell];
+     });
++
++    // Re-apply the saved third-party-cookie setting to the network service.
++    if (ShellContentBrowserClient::Get()
++            ->GetSitePermission("*", "block_third_party_cookies")
++            .value_or(false)) {
++      shell->web_contents()
++          ->GetBrowserContext()
++          ->GetDefaultStoragePartition()
++          ->GetCookieManagerForBrowserProcess()
++          ->BlockThirdPartyCookies(true);
++    }
+   }
+ }
+ 
