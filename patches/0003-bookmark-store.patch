@@ -1,0 +1,73 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 948a8755c0..86697ca7cf 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -28,6 +28,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/sequence_local_storage_slot.h"
++#include "base/values.h"
+ #include "build/build_config.h"
+ #include "cc/base/switches.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
+@@ -145,6 +146,11 @@ namespace {
+ inline constexpr char kJITEnabled[] = "settings.javascript.jit";
+ #endif
+ 
++// Bookmarks are persisted as a JSON dict in local state (see GetBookmarks /
++// SetBookmarks). This gives the browser UI a simple persistent store without
++// depending on the heavier //components/bookmarks.
++inline constexpr char kBookmarks[] = "content_shell.bookmarks";
++
+ using PerformanceManagerRegistry =
+     performance_manager::PerformanceManagerRegistry;
+ 
+@@ -283,6 +289,7 @@ std::unique_ptr<PrefService> CreateLocalState() {
+   auto pref_registry = base::MakeRefCounted<PrefRegistrySimple>();
+   metrics::MetricsService::RegisterPrefs(pref_registry.get());
+   variations::VariationsService::RegisterPrefs(pref_registry.get());
++  pref_registry->RegisterDictionaryPref(kBookmarks);
+ 
+ #if BUILDFLAG(IS_IOS)
+   pref_registry->RegisterBooleanPref(kJITEnabled, true);
+@@ -469,6 +476,15 @@ void ShellContentBrowserClient::SetJITEnabled(bool value) {
+ }
+ #endif
+ 
++base::DictValue ShellContentBrowserClient::GetBookmarks() {
++  return GetSharedState().local_state->GetDict(kBookmarks).Clone();
++}
++
++void ShellContentBrowserClient::SetBookmarks(base::DictValue bookmarks) {
++  GetSharedState().local_state->SetDict(kBookmarks, std::move(bookmarks));
++  GetSharedState().local_state->CommitPendingWrite();
++}
++
+ device::GeolocationSystemPermissionManager*
+ ShellContentBrowserClient::GetGeolocationSystemPermissionManager() {
+ #if BUILDFLAG(IS_MAC)
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index b9d397b810..0130a5f56c 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -11,6 +11,7 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/values.h"
+ #include "build/build_config.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/shell/browser/shell_speech_recognition_manager_delegate.h"
+@@ -207,6 +208,12 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   void SetJITEnabled(bool value);
+ #endif
+ 
++  // Persistent bookmark store, backed by a JSON dict in local state. Returns a
++  // copy; SetBookmarks replaces the stored dict and flushes to disk. Used by the
++  // browser UI (bookmark bar) instead of //components/bookmarks.
++  base::DictValue GetBookmarks();
++  void SetBookmarks(base::DictValue bookmarks);
++
+  protected:
+   // Call this if CreateBrowserMainParts() is overridden in a subclass.
+   void set_browser_main_parts(ShellBrowserMainParts* parts);

@@ -19,6 +19,12 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `@available(macOS 11.0, *)` with a text fallback. Also touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`** (it edits
   a method that `0001` introduced).
+- **`0003-bookmark-store.patch`** — persistent **bookmark store** (no UI yet): registers a
+  `content_shell.bookmarks` JSON dict pref in `CreateLocalState()` and exposes
+  `GetBookmarks()/SetBookmarks()` on `ShellContentBrowserClient` (backed by the existing
+  `PrefService`/`Local State`, avoiding `//components/bookmarks`). Touches
+  `content/shell/browser/shell_content_browser_client.{cc,h}` — an *independent* patch (different
+  files from `0001`/`0002`). Backing store for the upcoming bookmark bar.
 
 ## Workflow
 
