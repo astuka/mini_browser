@@ -85,8 +85,10 @@ Run it:
   content_shell, from scratch (no `//chrome/browser/extensions`). So far: an **extension model +
   unpacked loader + manager** (⌘⇧E) — load an unpacked extension folder, parse its MV3
   `manifest.json`, derive a Chrome-style id from the path, and list/enable/disable/remove it from a
-  management window, persisted across restarts (no execution yet; `chrome-extension://` resource
-  serving and content-script injection come next).
+  management window, persisted across restarts; and the **`chrome-extension://` scheme + a
+  file-serving URLLoaderFactory** — extension pages, icons, and other bundled resources load from
+  the extension's on-disk root under a real `chrome-extension://<id>` origin, with path-traversal
+  rejected. (Content-script injection and the `chrome.*` API surface come next.)
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

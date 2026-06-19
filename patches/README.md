@@ -205,6 +205,23 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `//crypto` dep), `shell_content_browser_client.{cc,h}` (the store), and
   `shell_platform_delegate_mac.mm` (manifest parsing + manager UI + ⌘⇧E hook); stacks on `0003`/
   `0010` for the store accessors and on the full `.mm` chain through `0019`.
+- **`0021-extension-resource-serving.patch`** — the **`chrome-extension://` scheme + a file-serving
+  `URLLoaderFactory`** (E2). Registers `chrome-extension` as a **standard + secure** scheme in
+  `ShellContentClient::AddAdditionalSchemes` (so extension pages get a real, trustworthy origin) and
+  adds it to `IsHandledURL`. A new **`ShellExtensionURLLoaderFactory`** (a
+  `network::SelfDeletingURLLoaderFactory`, new file `shell_extension_url_loader_factory.{cc,h}`)
+  serves `chrome-extension://<id>/<path>` by looking up the extension's on-disk root in the `0020`
+  store, resolving the path **off-thread** (`ThreadPool` + `MayBlock`), reading the file, guessing
+  its MIME type (`net::GetMimeTypeFromFile`), and streaming it back over a mojo data pipe — modeled
+  on content's `DataURLLoaderFactory`. **Path traversal is rejected**: the resolved file must live
+  inside the extension root (`MakeAbsoluteFilePath` + `IsParent`), so `..`/percent-encoded escapes
+  return `ERR_ACCESS_DENIED`; unknown id / missing file return `ERR_FILE_NOT_FOUND`. Wired in via
+  `ShellContentBrowserClient::CreateNonNetworkNavigationURLLoaderFactory` (extension-page
+  navigations) and `RegisterNonNetworkSubresourceURLLoaderFactories` (the page's own bundled
+  icons/scripts/etc.). Touches `content/shell/BUILD.gn` (new sources), `shell_content_client.cc`
+  (scheme), `shell_content_browser_client.{cc,h}` (the two factory hooks + `IsHandledURL`), and adds
+  the factory files; stacks on `0020` (reads its extension store). Everything (extension pages,
+  popups, icons, content-script files) will ride on this scheme.
 
 ## Workflow
 
