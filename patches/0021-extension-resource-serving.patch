@@ -1,0 +1,386 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 31a4d03694..343b65ed9b 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -200,6 +200,8 @@ static_library("content_shell_lib") {
+     "browser/shell_devtools_manager_delegate.h",
+     "browser/shell_download_manager_delegate.cc",
+     "browser/shell_download_manager_delegate.h",
++    "browser/shell_extension_url_loader_factory.cc",
++    "browser/shell_extension_url_loader_factory.h",
+     "browser/shell_javascript_dialog.h",
+     "browser/shell_javascript_dialog_manager.cc",
+     "browser/shell_javascript_dialog_manager.h",
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index fef9e306f6..be559781dd 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -80,6 +80,7 @@
+ #include "content/shell/browser/shell_platform_delegate.h"
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
++#include "content/shell/browser/shell_extension_url_loader_factory.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+ #include "content/shell/common/rust_test.test-mojom.h"
+ #include "content/shell/common/shell_controller.test-mojom.h"
+@@ -435,6 +436,7 @@ bool ShellContentBrowserClient::IsHandledURL(const GURL& url) {
+       kChromeDevToolsScheme,
+       url::kDataScheme,
+       url::kFileScheme,
++      kShellExtensionScheme,
+   });
+ 
+   return kProtocolList.contains(url.scheme());
+@@ -743,6 +745,29 @@ void ShellContentBrowserClient::OpenURL(
+           ->web_contents());
+ }
+ 
++mojo::PendingRemote<network::mojom::URLLoaderFactory>
++ShellContentBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
++    const std::string& scheme,
++    FrameTreeNodeId frame_tree_node_id) {
++  // Serve chrome-extension:// navigations (e.g. opening an extension page) from
++  // our extension resource server (Graft epic).
++  if (scheme == kShellExtensionScheme) {
++    return ShellExtensionURLLoaderFactory::Create();
++  }
++  return mojo::PendingRemote<network::mojom::URLLoaderFactory>();
++}
++
++void ShellContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
++    int render_process_id,
++    int render_frame_id,
++    const std::optional<url::Origin>& request_initiator_origin,
++    NonNetworkURLLoaderFactoryMap* factories) {
++  // Let extension pages load their own bundled subresources (icons, scripts,
++  // etc.) over chrome-extension://.
++  factories->emplace(kShellExtensionScheme,
++                     ShellExtensionURLLoaderFactory::Create());
++}
++
+ namespace {
+ 
+ // Hosts the user has chosen to load over plain HTTP. Session-scoped for now; a
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index 9c80680c43..3c634225ac 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -111,6 +111,15 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   void OpenURL(SiteInstance* site_instance,
+                const OpenURLParams& params,
+                base::OnceCallback<void(WebContents*)> callback) override;
++  mojo::PendingRemote<network::mojom::URLLoaderFactory>
++  CreateNonNetworkNavigationURLLoaderFactory(
++      const std::string& scheme,
++      FrameTreeNodeId frame_tree_node_id) override;
++  void RegisterNonNetworkSubresourceURLLoaderFactories(
++      int render_process_id,
++      int render_frame_id,
++      const std::optional<url::Origin>& request_initiator_origin,
++      NonNetworkURLLoaderFactoryMap* factories) override;
+   void CreateThrottlesForNavigation(
+       NavigationThrottleRegistry& registry) override;
+   std::unique_ptr<LoginDelegate> CreateLoginDelegate(
+diff --git a/content/shell/browser/shell_extension_url_loader_factory.cc b/content/shell/browser/shell_extension_url_loader_factory.cc
+new file mode 100644
+index 0000000000..7933196c4a
+--- /dev/null
++++ b/content/shell/browser/shell_extension_url_loader_factory.cc
+@@ -0,0 +1,218 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/browser/shell_extension_url_loader_factory.h"
++
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/strings/escape.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "content/shell/browser/shell_content_browser_client.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "mojo/public/cpp/system/data_pipe_producer.h"
++#include "mojo/public/cpp/system/string_data_source.h"
++#include "net/base/mime_util.h"
++#include "net/base/net_errors.h"
++#include "net/http/http_response_headers.h"
++#include "net/http/http_version.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace content {
++
++namespace {
++
++// The result of resolving + reading an extension resource off-thread.
++struct FileResult {
++  net::Error error = net::ERR_FAILED;
++  std::string data;
++  std::string mime_type;
++};
++
++// Looks up the on-disk root for `extension_id` in the persisted extensions
++// store. Must run on the UI thread (touches PrefService). Returns an empty path
++// if the extension isn't installed.
++base::FilePath RootForExtension(const std::string& extension_id) {
++  base::DictValue extensions =
++      ShellContentBrowserClient::Get()->GetExtensions();
++  const base::DictValue* entry = extensions.FindDict(extension_id);
++  if (!entry) {
++    return base::FilePath();
++  }
++  const std::string* path = entry->FindString("path");
++  if (!path) {
++    return base::FilePath();
++  }
++  return base::FilePath::FromUTF8Unsafe(*path);
++}
++
++// Resolves `relative_path` against the extension `root`, reads the file, and
++// guesses its MIME type. Runs on a MayBlock thread pool task. Rejects any path
++// that escapes the extension root (e.g. via "..").
++FileResult ReadExtensionResource(base::FilePath root,
++                                 std::string relative_path) {
++  FileResult result;
++
++  base::FilePath root_abs = base::MakeAbsoluteFilePath(root);
++  if (root_abs.empty()) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++
++  if (relative_path.empty()) {
++    // No directory listing — a bare "chrome-extension://<id>/" has no resource.
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++
++  base::FilePath candidate =
++      root_abs.Append(base::FilePath::FromUTF8Unsafe(relative_path));
++  base::FilePath resolved = base::MakeAbsoluteFilePath(candidate);
++  if (resolved.empty()) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++
++  // Security: the resolved file must live inside the extension root.
++  if (root_abs != resolved && !root_abs.IsParent(resolved)) {
++    result.error = net::ERR_ACCESS_DENIED;
++    return result;
++  }
++
++  if (!base::ReadFileToString(resolved, &result.data)) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++
++  if (!net::GetMimeTypeFromFile(resolved, &result.mime_type)) {
++    result.mime_type = "application/octet-stream";
++  }
++  result.error = net::OK;
++  return result;
++}
++
++// Holds the producer + client alive while the response body is streamed.
++struct WriteData {
++  mojo::Remote<network::mojom::URLLoaderClient> client;
++  std::string data;
++  std::unique_ptr<mojo::DataPipeProducer> producer;
++};
++
++void OnWrite(std::unique_ptr<WriteData> write_data, MojoResult result) {
++  if (result != MOJO_RESULT_OK) {
++    write_data->client->OnComplete(
++        network::URLLoaderCompletionStatus(net::ERR_FAILED));
++    return;
++  }
++  network::URLLoaderCompletionStatus status(net::OK);
++  status.encoded_data_length = write_data->data.size();
++  status.encoded_body_length = write_data->data.size();
++  status.decoded_body_length = write_data->data.size();
++  write_data->client->OnComplete(status);
++}
++
++// Builds and sends the response on the UI thread once the file has been read.
++void OnResourceRead(mojo::Remote<network::mojom::URLLoaderClient> client,
++                    FileResult result) {
++  if (result.error != net::OK) {
++    client->OnComplete(network::URLLoaderCompletionStatus(result.error));
++    return;
++  }
++
++  std::string content_length = base::NumberToString(result.data.size());
++  auto response = network::mojom::URLResponseHead::New();
++  response->mime_type = result.mime_type;
++  response->headers =
++      net::HttpResponseHeaders::Builder(net::HttpVersion(1, 1), "200 OK")
++          .AddHeader("Content-Type", result.mime_type)
++          .AddHeader("Content-Length", content_length)
++          .Build();
++  response->content_length = result.data.size();
++
++  mojo::ScopedDataPipeProducerHandle producer;
++  mojo::ScopedDataPipeConsumerHandle consumer;
++  if (CreateDataPipe(nullptr, producer, consumer) != MOJO_RESULT_OK) {
++    client->OnComplete(
++        network::URLLoaderCompletionStatus(net::ERR_INSUFFICIENT_RESOURCES));
++    return;
++  }
++
++  client->OnReceiveResponse(std::move(response), std::move(consumer),
++                            std::nullopt);
++
++  auto write_data = std::make_unique<WriteData>();
++  write_data->client = std::move(client);
++  write_data->data = std::move(result.data);
++  write_data->producer =
++      std::make_unique<mojo::DataPipeProducer>(std::move(producer));
++
++  mojo::DataPipeProducer* producer_ptr = write_data->producer.get();
++  std::string_view body(write_data->data);
++  producer_ptr->Write(
++      std::make_unique<mojo::StringDataSource>(
++          body, mojo::StringDataSource::AsyncWritingMode::
++                    STRING_STAYS_VALID_UNTIL_COMPLETION),
++      base::BindOnce(OnWrite, std::move(write_data)));
++}
++
++}  // namespace
++
++// static
++mojo::PendingRemote<network::mojom::URLLoaderFactory>
++ShellExtensionURLLoaderFactory::Create() {
++  mojo::PendingRemote<network::mojom::URLLoaderFactory> pending_remote;
++  // Self-deletes once all receivers disconnect.
++  new ShellExtensionURLLoaderFactory(
++      pending_remote.InitWithNewPipeAndPassReceiver());
++  return pending_remote;
++}
++
++ShellExtensionURLLoaderFactory::ShellExtensionURLLoaderFactory(
++    mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver)
++    : network::SelfDeletingURLLoaderFactory(std::move(factory_receiver)) {}
++
++ShellExtensionURLLoaderFactory::~ShellExtensionURLLoaderFactory() = default;
++
++void ShellExtensionURLLoaderFactory::CreateLoaderAndStart(
++    mojo::PendingReceiver<network::mojom::URLLoader> loader,
++    int32_t request_id,
++    uint32_t options,
++    const network::ResourceRequest& request,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  mojo::Remote<network::mojom::URLLoaderClient> client_remote(std::move(client));
++
++  // chrome-extension://<id>/<path> — the host is the extension id.
++  const std::string extension_id(request.url.host());
++  base::FilePath root = RootForExtension(extension_id);
++  if (root.empty()) {
++    client_remote->OnComplete(
++        network::URLLoaderCompletionStatus(net::ERR_FILE_NOT_FOUND));
++    return;
++  }
++
++  // Strip the leading '/' and percent-decode the path. Any "../" traversal is
++  // caught later by the root-containment check in ReadExtensionResource.
++  std::string path(request.url.path());
++  if (!path.empty() && path.front() == '/') {
++    path.erase(0, 1);
++  }
++  std::string relative_path = base::UnescapeBinaryURLComponent(path);
++
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(&ReadExtensionResource, std::move(root),
++                     std::move(relative_path)),
++      base::BindOnce(&OnResourceRead, std::move(client_remote)));
++}
++
++}  // namespace content
+diff --git a/content/shell/browser/shell_extension_url_loader_factory.h b/content/shell/browser/shell_extension_url_loader_factory.h
+new file mode 100644
+index 0000000000..f5a4075961
+--- /dev/null
++++ b/content/shell/browser/shell_extension_url_loader_factory.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_SHELL_EXTENSION_URL_LOADER_FACTORY_H_
++#define CONTENT_SHELL_BROWSER_SHELL_EXTENSION_URL_LOADER_FACTORY_H_
++
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/network/public/cpp/self_deleting_url_loader_factory.h"
++#include "services/network/public/mojom/url_loader_factory.mojom.h"
++
++namespace content {
++
++// The privileged scheme that installed extensions' resources are served from.
++inline constexpr char kShellExtensionScheme[] = "chrome-extension";
++
++// Serves `chrome-extension://<id>/<path>` requests by reading files from the
++// matching installed extension's on-disk root (looked up live in the
++// `content_shell.extensions` store). This is our own miniature extension
++// resource server, built directly on content_shell — there is no
++// //extensions layer. Path traversal outside the extension root is rejected.
++//
++// One factory instance handles all requests for the scheme; it self-deletes
++// once its mojo receivers disconnect (see network::SelfDeletingURLLoaderFactory).
++class ShellExtensionURLLoaderFactory
++    : public network::SelfDeletingURLLoaderFactory {
++ public:
++  // Returns a new factory bound to a fresh pipe. The instance owns its own
++  // lifetime.
++  static mojo::PendingRemote<network::mojom::URLLoaderFactory> Create();
++
++  ShellExtensionURLLoaderFactory(const ShellExtensionURLLoaderFactory&) =
++      delete;
++  ShellExtensionURLLoaderFactory& operator=(
++      const ShellExtensionURLLoaderFactory&) = delete;
++
++ private:
++  explicit ShellExtensionURLLoaderFactory(
++      mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver);
++  ~ShellExtensionURLLoaderFactory() override;
++
++  // network::mojom::URLLoaderFactory:
++  void CreateLoaderAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      override;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_SHELL_EXTENSION_URL_LOADER_FACTORY_H_
+diff --git a/content/shell/common/shell_content_client.cc b/content/shell/common/shell_content_client.cc
+index 2af9f0b1b5..8cbdb7a82b 100644
+--- a/content/shell/common/shell_content_client.cc
++++ b/content/shell/common/shell_content_client.cc
+@@ -76,6 +76,12 @@ void ShellContentClient::AddAdditionalSchemes(Schemes* schemes) {
+ #if BUILDFLAG(IS_ANDROID)
+   schemes->local_schemes.push_back(url::kContentScheme);
+ #endif
++  // The chrome-extension:// scheme used by our from-scratch extension runtime
++  // (Graft epic). Registering it as standard + secure gives extension pages a
++  // proper, trustworthy origin; the resources themselves are served by
++  // ShellExtensionURLLoaderFactory.
++  schemes->standard_schemes.emplace_back("chrome-extension");
++  schemes->secure_schemes.emplace_back("chrome-extension");
+   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+   if (command_line->HasSwitch(switches::kTestRegisterStandardScheme)) {
+     std::string scheme = command_line->GetSwitchValueASCII(
