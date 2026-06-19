@@ -222,6 +222,25 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (scheme), `shell_content_browser_client.{cc,h}` (the two factory hooks + `IsHandledURL`), and adds
   the factory files; stacks on `0020` (reads its extension store). Everything (extension pages,
   popups, icons, content-script files) will ride on this scheme.
+- **`0022-content-script-injection.patch`** — **content-script injection into isolated worlds** (E3),
+  the first feature with **renderer-side** code. Extensions' `content_scripts` now run on matching
+  pages. A new browser→renderer-queried Mojo interface **`mojom::ShellExtensionScripts`** (new file
+  `common/shell_extension_scripts.mojom`) returns each enabled extension's content scripts (match
+  patterns, `run_at`, an isolated-world id, and the JS already read from disk). The browser impl
+  **`ShellExtensionScriptsImpl`** (new files `shell_extension_scripts_impl.{cc,h}`) re-reads each
+  enabled extension's `manifest.json` + JS files **off-thread** (`ThreadPool`/`MayBlock`) and is
+  registered per-frame in `RegisterBrowserInterfaceBindersForFrame`. The renderer side lives in
+  **`ShellRenderFrameObserver`**: it fetches the scripts once per frame via the
+  `BrowserInterfaceBroker`, caches them, and on each navigation's `DidCreateDocumentElement` /
+  `DidDispatchDOMContentLoadedEvent` / `DidFinishLoad` (mapped to `document_start`/`end`/`idle`)
+  matches the frame URL against the patterns and injects matching scripts with
+  `WebLocalFrame::ExecuteScriptInIsolatedWorld` (a stable world id per extension, so content scripts
+  can't see page JS globals). Includes a from-scratch match-pattern matcher (`<all_urls>`, `*`
+  scheme, `*.host` suffixes, `*` path globs) + `exclude_matches`, and a late-arrival catch-up so
+  scripts still inject for stages that already fired. Touches `content/shell/BUILD.gn` (mojom + new
+  sources), `shell_content_browser_client.cc` (the binder), and rewrites
+  `renderer/shell_render_frame_observer.{cc,h}`; adds the mojom + browser-impl files. Stacks on `0020`
+  (reads its extension store). Default MV3 `run_at` is `document_idle`.
 
 ## Workflow
 

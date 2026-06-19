@@ -1,0 +1,553 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 343b65ed9b..b0ff56abe5 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -200,6 +200,8 @@ static_library("content_shell_lib") {
+     "browser/shell_devtools_manager_delegate.h",
+     "browser/shell_download_manager_delegate.cc",
+     "browser/shell_download_manager_delegate.h",
++    "browser/shell_extension_scripts_impl.cc",
++    "browser/shell_extension_scripts_impl.h",
+     "browser/shell_extension_url_loader_factory.cc",
+     "browser/shell_extension_url_loader_factory.h",
+     "browser/shell_javascript_dialog.h",
+@@ -1095,6 +1097,7 @@ mojom("content_browsertests_mojom") {
+     "common/memory_coordinator/memory_coordinator_test.mojom",
+     "common/power_monitor_test.mojom",
+     "common/render_frame_test_helper.mojom",
++    "common/shell_extension_scripts.mojom",
+   ]
+   public_deps = [
+     "//content/common/memory_coordinator/mojom",
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index be559781dd..5339b577ca 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -80,6 +80,7 @@
+ #include "content/shell/browser/shell_platform_delegate.h"
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
++#include "content/shell/browser/shell_extension_scripts_impl.h"
+ #include "content/shell/browser/shell_extension_url_loader_factory.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+ #include "content/shell/common/rust_test.test-mojom.h"
+@@ -718,6 +719,9 @@ void ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
+   map->Add<network_hints::mojom::NetworkHintsHandler>(&BindNetworkHintsHandler);
+   map->Add<content::rust_test::mojom::RustTestService>(
+       base::BindRepeating(&BindRustTestServiceReceiver));
++  // Lets the renderer fetch installed extensions' content scripts (Graft epic).
++  map->Add<mojom::ShellExtensionScripts>(
++      base::BindRepeating(&ShellExtensionScriptsImpl::Create));
+ #if BUILDFLAG(IS_WIN)
+   map->Add<media::mojom::MediaFoundationPreferences>(
+       &BindMediaFoundationPreferences);
+diff --git a/content/shell/browser/shell_extension_scripts_impl.cc b/content/shell/browser/shell_extension_scripts_impl.cc
+new file mode 100644
+index 0000000000..12d3f3cec1
+--- /dev/null
++++ b/content/shell/browser/shell_extension_scripts_impl.cc
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/browser/shell_extension_scripts_impl.h"
++
++#include <functional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "content/shell/browser/shell_content_browser_client.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace content {
++
++namespace {
++
++// An enabled extension's id + on-disk root, snapshotted on the UI thread before
++// the (blocking) manifest/JS reads happen on a worker thread.
++struct ExtensionSpec {
++  std::string id;
++  std::string path;
++};
++
++mojom::ContentScriptRunAt ParseRunAt(const std::string* run_at) {
++  if (run_at) {
++    if (*run_at == "document_start") {
++      return mojom::ContentScriptRunAt::kDocumentStart;
++    }
++    if (*run_at == "document_end") {
++      return mojom::ContentScriptRunAt::kDocumentEnd;
++    }
++  }
++  // MV3 default.
++  return mojom::ContentScriptRunAt::kDocumentIdle;
++}
++
++void AppendStrings(const base::ListValue* list, std::vector<std::string>* out) {
++  if (!list) {
++    return;
++  }
++  for (const base::Value& v : *list) {
++    if (v.is_string()) {
++      out->push_back(v.GetString());
++    }
++  }
++}
++
++// Reads each extension's manifest + content-script JS from disk. Runs on a
++// MayBlock thread pool task.
++std::vector<mojom::ContentScriptPtr> BuildContentScripts(
++    std::vector<ExtensionSpec> specs) {
++  std::vector<mojom::ContentScriptPtr> result;
++
++  for (const ExtensionSpec& spec : specs) {
++    base::FilePath root = base::FilePath::FromUTF8Unsafe(spec.path);
++    std::string manifest_text;
++    if (!base::ReadFileToString(root.Append("manifest.json"), &manifest_text)) {
++      continue;
++    }
++    std::optional<base::Value> parsed = base::JSONReader::Read(
++        manifest_text, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++    if (!parsed || !parsed->is_dict()) {
++      continue;
++    }
++    const base::ListValue* content_scripts =
++        parsed->GetDict().FindList("content_scripts");
++    if (!content_scripts) {
++      continue;
++    }
++
++    // A stable isolated world per extension within this renderer.
++    const int32_t world_id =
++        1000 + static_cast<int32_t>(std::hash<std::string>{}(spec.id) % 1000);
++
++    for (const base::Value& entry : *content_scripts) {
++      if (!entry.is_dict()) {
++        continue;
++      }
++      const base::DictValue& cs = entry.GetDict();
++
++      auto script = mojom::ContentScript::New();
++      AppendStrings(cs.FindList("matches"), &script->matches);
++      AppendStrings(cs.FindList("exclude_matches"), &script->exclude_matches);
++      script->run_at = ParseRunAt(cs.FindString("run_at"));
++      script->world_id = world_id;
++
++      if (const base::ListValue* js = cs.FindList("js")) {
++        for (const base::Value& file : *js) {
++          if (!file.is_string()) {
++            continue;
++          }
++          std::string source;
++          if (base::ReadFileToString(
++                  root.Append(base::FilePath::FromUTF8Unsafe(file.GetString())),
++                  &source)) {
++            script->js_sources.push_back(std::move(source));
++          }
++        }
++      }
++
++      if (!script->matches.empty() && !script->js_sources.empty()) {
++        result.push_back(std::move(script));
++      }
++    }
++  }
++
++  return result;
++}
++
++}  // namespace
++
++// static
++void ShellExtensionScriptsImpl::Create(
++    RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<mojom::ShellExtensionScripts> receiver) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<ShellExtensionScriptsImpl>(),
++                              std::move(receiver));
++}
++
++ShellExtensionScriptsImpl::ShellExtensionScriptsImpl() = default;
++ShellExtensionScriptsImpl::~ShellExtensionScriptsImpl() = default;
++
++void ShellExtensionScriptsImpl::GetContentScripts(
++    GetContentScriptsCallback callback) {
++  // Snapshot enabled extensions on the UI thread (touches the pref store).
++  base::DictValue extensions =
++      ShellContentBrowserClient::Get()->GetExtensions();
++  std::vector<ExtensionSpec> specs;
++  for (auto&& [id, value] : extensions) {
++    if (!value.is_dict()) {
++      continue;
++    }
++    const base::DictValue& dict = value.GetDict();
++    if (!dict.FindBool("enabled").value_or(true)) {
++      continue;
++    }
++    const std::string* path = dict.FindString("path");
++    if (!path) {
++      continue;
++    }
++    specs.push_back({id, *path});
++  }
++
++  // The manifest + JS reads block, so do them off the UI thread.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(&BuildContentScripts, std::move(specs)),
++      std::move(callback));
++}
++
++}  // namespace content
+diff --git a/content/shell/browser/shell_extension_scripts_impl.h b/content/shell/browser/shell_extension_scripts_impl.h
+new file mode 100644
+index 0000000000..1ae762ab9a
+--- /dev/null
++++ b/content/shell/browser/shell_extension_scripts_impl.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_SHELL_EXTENSION_SCRIPTS_IMPL_H_
++#define CONTENT_SHELL_BROWSER_SHELL_EXTENSION_SCRIPTS_IMPL_H_
++
++#include "content/shell/common/shell_extension_scripts.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace content {
++
++class RenderFrameHost;
++
++// Browser-side provider of installed extensions' content scripts (Graft epic,
++// E3). The renderer queries this once per frame; we read each enabled
++// extension's manifest + JS files from disk and hand back the scripts so the
++// renderer can match URLs and inject them into isolated worlds.
++class ShellExtensionScriptsImpl : public mojom::ShellExtensionScripts {
++ public:
++  // Binder for ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame.
++  static void Create(
++      RenderFrameHost* render_frame_host,
++      mojo::PendingReceiver<mojom::ShellExtensionScripts> receiver);
++
++  ShellExtensionScriptsImpl();
++  ~ShellExtensionScriptsImpl() override;
++
++  ShellExtensionScriptsImpl(const ShellExtensionScriptsImpl&) = delete;
++  ShellExtensionScriptsImpl& operator=(const ShellExtensionScriptsImpl&) =
++      delete;
++
++  // mojom::ShellExtensionScripts:
++  void GetContentScripts(GetContentScriptsCallback callback) override;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_SHELL_EXTENSION_SCRIPTS_IMPL_H_
+diff --git a/content/shell/common/shell_extension_scripts.mojom b/content/shell/common/shell_extension_scripts.mojom
+new file mode 100644
+index 0000000000..e4ea6eb001
+--- /dev/null
++++ b/content/shell/common/shell_extension_scripts.mojom
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module content.mojom;
++
++// When a content script runs relative to document load. Mirrors the MV3
++// manifest "run_at" values.
++enum ContentScriptRunAt {
++  kDocumentStart,
++  kDocumentEnd,
++  kDocumentIdle,
++};
++
++// One content script declaration from an installed extension, with its JS
++// already read from disk by the browser. The renderer matches `matches` /
++// `exclude_matches` against each frame's URL and injects `js_sources` into the
++// extension's isolated world at `run_at`.
++struct ContentScript {
++  array<string> matches;
++  array<string> exclude_matches;
++  array<string> js_sources;
++  ContentScriptRunAt run_at;
++  // The isolated world the scripts run in (stable per extension within a
++  // renderer; assigned by the browser).
++  int32 world_id;
++};
++
++// Browser-implemented, queried per RenderFrame. Our own minimal content-script
++// delivery channel, built on content_shell (no //extensions).
++interface ShellExtensionScripts {
++  // Returns all content scripts declared by currently-enabled extensions.
++  GetContentScripts() => (array<ContentScript> scripts);
++};
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index 3fb7ab7f91..e9a19cb18f 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -4,18 +4,125 @@
+ 
+ #include "content/shell/renderer/shell_render_frame_observer.h"
+ 
++#include <string_view>
++#include <utility>
++
+ #include "base/command_line.h"
++#include "base/functional/bind.h"
+ #include "content/public/renderer/render_frame.h"
+ #include "content/public/renderer/render_frame_observer.h"
+ #include "content/shell/common/render_frame_test_helper.mojom.h"
+ #include "content/shell/common/shell_switches.h"
+ #include "content/shell/renderer/render_frame_test_helper.h"
++#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_script_source.h"
+ #include "third_party/blink/public/web/web_testing_support.h"
++#include "url/gurl.h"
+ 
+ namespace content {
+ 
++namespace {
++
++int RunAtBit(mojom::ContentScriptRunAt run_at) {
++  return 1 << static_cast<int>(run_at);
++}
++
++// Matches `str` against a glob `pattern` where '*' matches any (possibly empty)
++// run of characters. No other metacharacters (Chrome match-pattern paths only
++// use '*').
++bool GlobMatch(std::string_view pattern, std::string_view str) {
++  size_t p = 0, s = 0, star = std::string_view::npos, mark = 0;
++  while (s < str.size()) {
++    if (p < pattern.size() && (pattern[p] == '*')) {
++      star = p++;
++      mark = s;
++    } else if (p < pattern.size() && pattern[p] == str[s]) {
++      ++p;
++      ++s;
++    } else if (star != std::string_view::npos) {
++      p = star + 1;
++      s = ++mark;
++    } else {
++      return false;
++    }
++  }
++  while (p < pattern.size() && pattern[p] == '*') {
++    ++p;
++  }
++  return p == pattern.size();
++}
++
++// Implements a useful subset of Chrome's content-script match patterns:
++// "<all_urls>", "*://*/*", "https://*.example.com/*", etc.
++bool MatchesPattern(const std::string& pattern, const GURL& url) {
++  if (pattern == "<all_urls>") {
++    return url.SchemeIs("http") || url.SchemeIs("https") ||
++           url.SchemeIs("file");
++  }
++
++  size_t scheme_end = pattern.find("://");
++  if (scheme_end == std::string::npos) {
++    return false;
++  }
++  std::string scheme = pattern.substr(0, scheme_end);
++  std::string rest = pattern.substr(scheme_end + 3);
++  size_t path_start = rest.find('/');
++  if (path_start == std::string::npos) {
++    return false;
++  }
++  std::string host = rest.substr(0, path_start);
++  std::string path = rest.substr(path_start);
++
++  // Scheme: '*' means http or https.
++  if (scheme == "*") {
++    if (!url.SchemeIs("http") && !url.SchemeIs("https")) {
++      return false;
++    }
++  } else if (!url.SchemeIs(scheme)) {
++    return false;
++  }
++
++  // Host: '*' (any), "*.suffix" (suffix or subdomain), or an exact host.
++  std::string url_host(url.host());
++  if (host == "*") {
++    // Matches any host.
++  } else if (host.size() > 2 && host[0] == '*' && host[1] == '.') {
++    std::string suffix = host.substr(2);
++    if (url_host != suffix &&
++        !(url_host.size() > suffix.size() &&
++          url_host.ends_with("." + suffix))) {
++      return false;
++    }
++  } else if (url_host != host) {
++    return false;
++  }
++
++  return GlobMatch(path, url.path());
++}
++
++bool ScriptMatchesUrl(const mojom::ContentScript& script, const GURL& url) {
++  for (const std::string& exclude : script.exclude_matches) {
++    if (MatchesPattern(exclude, url)) {
++      return false;
++    }
++  }
++  for (const std::string& match : script.matches) {
++    if (MatchesPattern(match, url)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ ShellRenderFrameObserver::ShellRenderFrameObserver(RenderFrame* render_frame)
+-    : RenderFrameObserver(render_frame) {}
++    : RenderFrameObserver(render_frame) {
++  RequestContentScripts();
++}
+ 
+ ShellRenderFrameObserver::~ShellRenderFrameObserver() = default;
+ 
+@@ -42,4 +149,78 @@ void ShellRenderFrameObserver::OnInterfaceRequestForFrame(
+   }
+ }
+ 
++void ShellRenderFrameObserver::DidCommitProvisionalLoad(
++    ui::PageTransition transition) {
++  // A new document: reset which run_at stages have fired.
++  stages_reached_ = 0;
++}
++
++void ShellRenderFrameObserver::DidCreateDocumentElement() {
++  HandleRunAt(mojom::ContentScriptRunAt::kDocumentStart);
++}
++
++void ShellRenderFrameObserver::DidDispatchDOMContentLoadedEvent() {
++  HandleRunAt(mojom::ContentScriptRunAt::kDocumentEnd);
++}
++
++void ShellRenderFrameObserver::DidFinishLoad() {
++  HandleRunAt(mojom::ContentScriptRunAt::kDocumentIdle);
++}
++
++void ShellRenderFrameObserver::RequestContentScripts() {
++  render_frame()->GetBrowserInterfaceBroker().GetInterface(
++      extension_scripts_.BindNewPipeAndPassReceiver());
++  extension_scripts_->GetContentScripts(
++      base::BindOnce(&ShellRenderFrameObserver::OnContentScripts,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void ShellRenderFrameObserver::OnContentScripts(
++    std::vector<mojom::ContentScriptPtr> scripts) {
++  content_scripts_ = std::move(scripts);
++  scripts_loaded_ = true;
++
++  // The scripts may have arrived after some run_at stages already fired for the
++  // current document — inject those now so nothing is missed.
++  for (mojom::ContentScriptRunAt run_at :
++       {mojom::ContentScriptRunAt::kDocumentStart,
++        mojom::ContentScriptRunAt::kDocumentEnd,
++        mojom::ContentScriptRunAt::kDocumentIdle}) {
++    if (stages_reached_ & RunAtBit(run_at)) {
++      InjectForRunAt(run_at);
++    }
++  }
++}
++
++void ShellRenderFrameObserver::HandleRunAt(
++    mojom::ContentScriptRunAt run_at) {
++  stages_reached_ |= RunAtBit(run_at);
++  if (scripts_loaded_) {
++    InjectForRunAt(run_at);
++  }
++}
++
++void ShellRenderFrameObserver::InjectForRunAt(
++    mojom::ContentScriptRunAt run_at) {
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (!frame) {
++    return;
++  }
++  GURL url = frame->GetDocument().Url();
++  for (const mojom::ContentScriptPtr& script : content_scripts_) {
++    if (script->run_at != run_at) {
++      continue;
++    }
++    if (!ScriptMatchesUrl(*script, url)) {
++      continue;
++    }
++    for (const std::string& source : script->js_sources) {
++      frame->ExecuteScriptInIsolatedWorld(
++          script->world_id,
++          blink::WebScriptSource(blink::WebString::FromUtf8(source)),
++          blink::BackForwardCacheAware::kPossiblyDisallow);
++    }
++  }
++}
++
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index c315565bd6..f18d479d9d 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -5,7 +5,12 @@
+ #ifndef CONTENT_SHELL_RENDERER_SHELL_RENDER_FRAME_OBSERVER_H_
+ #define CONTENT_SHELL_RENDERER_SHELL_RENDER_FRAME_OBSERVER_H_
+ 
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
+ #include "content/public/renderer/render_frame_observer.h"
++#include "content/shell/common/shell_extension_scripts.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
+ 
+ namespace content {
+ 
+@@ -24,6 +29,32 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void OnInterfaceRequestForFrame(
+       const std::string& interface_name,
+       mojo::ScopedMessagePipeHandle* interface_pipe) override;
++  // Content-script injection lifecycle (Graft epic, E3).
++  void DidCommitProvisionalLoad(ui::PageTransition transition) override;
++  void DidCreateDocumentElement() override;
++  void DidDispatchDOMContentLoadedEvent() override;
++  void DidFinishLoad() override;
++
++  // Fetches the installed extensions' content scripts from the browser (once
++  // per frame) and caches them.
++  void RequestContentScripts();
++  void OnContentScripts(std::vector<mojom::ContentScriptPtr> scripts);
++
++  // Marks `run_at` as reached for the current document and injects any matching
++  // scripts (if they've arrived yet).
++  void HandleRunAt(mojom::ContentScriptRunAt run_at);
++  // Injects all cached scripts for `run_at` that match the current frame URL.
++  void InjectForRunAt(mojom::ContentScriptRunAt run_at);
++
++  mojo::Remote<mojom::ShellExtensionScripts> extension_scripts_;
++  std::vector<mojom::ContentScriptPtr> content_scripts_;
++  bool scripts_loaded_ = false;
++  // Bitmask of ContentScriptRunAt stages already reached for the current
++  // document (reset on each commit), so scripts arriving late still inject for
++  // stages that already passed.
++  int stages_reached_ = 0;
++
++  base::WeakPtrFactory<ShellRenderFrameObserver> weak_factory_{this};
+ };
+ 
+ }  // namespace content
