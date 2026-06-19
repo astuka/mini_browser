@@ -37,6 +37,18 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `layoutTabRows` now iterates), makes `tabForShell:` recursive, and switches the last-tab
   teardown to a recursive `tabNodeCount`. Foundation so tab folders and multi-select can be added
   without reworking the model. Stacks on the other `.mm` patches.
+- **`0006-tab-folders.patch`** — **collapsible tab folders** in the vertical strip. Drag one tab
+  row onto another to create a folder containing both; drag more rows onto a folder (or onto a tab
+  already inside one) to add them; click a folder row to collapse/expand it (disclosure triangle
+  ▸/▾, with a live tab count). Children render indented; closing tabs auto-prunes — a folder that
+  drops to one child dissolves and lifts the survivor back up. Implemented by making each row a
+  `TabRowView` (an `NSDraggingSource`/`NSDraggingDestination`) and the title a `TabTitleButton`
+  that distinguishes a click from a drag by tracking the mouse; the tree mutation, pruning, and
+  indented layout all live in `TabbedShellController`. The drag uses a shared
+  `kTabRowPasteboardType` so a later "drag a tab onto the bookmark bar" feature can reuse it from a
+  different destination with no source-side change. Touches
+  `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`/`0004`/
+  `0005`** (it builds on the `0005` tree model).
 
 ## Workflow
 
