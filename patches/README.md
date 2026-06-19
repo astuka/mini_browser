@@ -31,6 +31,12 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   Adds a `layoutChrome`-style band (`kBookmarkBarHeight`) and updates `ResizeWebContent`. Touches
   `content/shell/browser/shell_platform_delegate_mac.mm`, so it **stacks on `0001`/`0002`**; it
   also depends on `0003`'s `GetBookmarks/SetBookmarks` accessor at runtime.
+- **`0005-tab-tree-refactor.patch`** — internal refactor with **no user-visible change**:
+  renames `TabInfo`→`TabNode` and adds (dormant) folder fields (`kind`, `children`, `expanded`,
+  `parent`), introduces a derived `_flatRows` render order via `rebuildFlatRows` (a DFS that
+  `layoutTabRows` now iterates), makes `tabForShell:` recursive, and switches the last-tab
+  teardown to a recursive `tabNodeCount`. Foundation so tab folders and multi-select can be added
+  without reworking the model. Stacks on the other `.mm` patches.
 
 ## Workflow
 
