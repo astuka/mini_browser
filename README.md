@@ -70,8 +70,10 @@ Run it:
   **session persistence** — your tabs and folders are restored automatically on
   the next launch (and after a crash). See `patches/README.md`.
 - 🛡️ **Security epic (in progress):** building browser-security primitives directly on
-  content_shell, from scratch (no `//chrome`). First up: a connection-security indicator
-  (lock / "Not Secure") derived ourselves from the navigation's TLS state.
+  content_shell, from scratch (no `//chrome`). So far: a connection-security indicator
+  (lock / "Not Secure") derived ourselves from the navigation's TLS state; a certificate
+  viewer (subject / issuer / validity / SANs); and a real certificate-error interstitial
+  ("Your connection is not private" with Back-to-safety / Proceed).
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

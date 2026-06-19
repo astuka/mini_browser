@@ -101,6 +101,26 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   and re-shown on tab switch. The indicator is a (currently no-op) button so the upcoming certificate
   viewer can hang off it. Touches `content/shell/browser/shell_platform_delegate_mac.mm`; stacks on
   the full `.mm` chain (`0001`/`0002`/`0004`/`0005`/`0006`/`0007`/`0008`/`0009`/`0010`).
+- **`0012-security-certificate-viewer.patch`** — clicking the `0011` indicator opens a **certificate
+  / connection popover**. For HTTPS it reads the server cert straight from the navigation's
+  `SSLStatus` (`net::X509Certificate`) and shows subject CN, organization, issuer, validity window
+  (UTC), and Subject Alternative Names; for HTTP it explains the connection is unencrypted with no
+  certificate; for internal pages it notes there's no network connection. An `NSPopover` anchored to
+  the indicator, toggled on click. Touches `content/shell/browser/shell_platform_delegate_mac.mm`;
+  stacks on the full `.mm` chain through `0011`.
+- **`0013-security-cert-error-interstitial.patch`** — a real **certificate-error interstitial**.
+  content_shell's default blocks bad-cert navigations outright; we override
+  `ShellContentBrowserClient::AllowCertificateError` and, for a top-level navigation, hand the
+  decision to a native **"Your connection is not private"** page (host + reason + net error code)
+  with **Back to safety** (cancel) and **Proceed anyway (unsafe)** (continue). The C++ client bridges
+  to the Mac UI via a new static `ShellPlatformDelegate::RequestCertificateErrorDecision` (the
+  move-only `OnceCallback` is wrapped in a block and run once). Introduces a **reusable interstitial
+  primitive** (`presentInterstitialInTab:…` — a centered card overlay with title/message/detail and
+  one or two block-backed buttons) that S4 (HTTPS-First) and S5 (blocklist) will reuse; the overlay
+  is per-tab (shown only for the active tab, above the web view) and cleared on resolve/close.
+  Touches `shell_content_browser_client.{cc,h}` (override), `shell_platform_delegate.h` (static
+  bridge decl), and `shell_platform_delegate_mac.mm` (UI). Stacks on the full `.mm` chain through
+  `0012`, plus `0003`/`0010` for the `shell_content_browser_client.{cc,h}` edits.
 
 ## Workflow
 
