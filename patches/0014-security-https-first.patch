@@ -1,0 +1,261 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 55b01a4e35..4a2eac3828 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -7,7 +7,9 @@
+ #include <stddef.h>
+ 
+ #include <functional>
++#include <map>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -30,7 +32,9 @@
+ #include "base/threading/sequence_local_storage_slot.h"
+ #include "base/values.h"
+ #include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
++#include "ui/base/page_transition_types.h"
+ #include "cc/base/switches.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
+ #include "components/custom_handlers/protocol_handler_throttle.h"
+@@ -50,10 +54,13 @@
+ #include "components/variations/service/variations_service.h"
+ #include "content/public/browser/client_certificate_delegate.h"
+ #include "content/public/browser/login_delegate.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/navigation_throttle.h"
+ #include "content/public/browser/navigation_throttle_registry.h"
+ #include "content/public/browser/network_service_instance.h"
+ #include "content/public/browser/page_navigator.h"
++#include "content/public/common/referrer.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/security_principal.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -682,8 +689,121 @@ void ShellContentBrowserClient::OpenURL(
+           ->web_contents());
+ }
+ 
++namespace {
++
++// Hosts the user has chosen to load over plain HTTP. Session-scoped for now; a
++// persistent SiteSettings store arrives in a later security PR.
++std::set<std::string>& HttpAllowlist() {
++  static base::NoDestructor<std::set<std::string>> allowlist;
++  return *allowlist;
++}
++
++// Maps a WebContents to the original http:// URL we upgraded from, so that if
++// the https attempt fails we can offer to fall back to it.
++std::map<WebContents*, GURL>& PendingUpgrades() {
++  static base::NoDestructor<std::map<WebContents*, GURL>> pending;
++  return *pending;
++}
++
++void LoadURLOnWebContents(base::WeakPtr<WebContents> web_contents, GURL url) {
++  if (web_contents) {
++    web_contents->GetController().LoadURL(
++        url, Referrer(), ui::PAGE_TRANSITION_TYPED, std::string());
++  }
++}
++
++bool ShouldSkipUpgrade(const GURL& url) {
++  if (!url.SchemeIs("http"))
++    return true;
++  if (url.host().empty() || url.HostIsIPAddress() || url.host() == "localhost")
++    return true;  // Don't upgrade local/IP hosts (often intentionally http).
++  return HttpAllowlist().count(std::string(url.host())) > 0;
++}
++
++// HTTPS-First mode, built from scratch (no //chrome HttpsUpgrades component):
++// upgrades top-level http navigations to https, and if the https attempt fails
++// offers a one-time "continue to http" interstitial.
++class HttpsUpgradeThrottle : public NavigationThrottle {
++ public:
++  explicit HttpsUpgradeThrottle(NavigationThrottleRegistry& registry)
++      : NavigationThrottle(registry) {}
++  ~HttpsUpgradeThrottle() override = default;
++
++  const char* GetNameForLogging() override { return "HttpsUpgradeThrottle"; }
++
++  ThrottleCheckResult WillStartRequest() override {
++    NavigationHandle* handle = navigation_handle();
++    if (!handle->IsInPrimaryMainFrame())
++      return PROCEED;
++    const GURL& url = handle->GetURL();
++    if (ShouldSkipUpgrade(url))
++      return PROCEED;
++
++    WebContents* web_contents = handle->GetWebContents();
++    PendingUpgrades()[web_contents] = url;  // Remember the original http URL.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&LoadURLOnWebContents,
++                                  web_contents->GetWeakPtr(), UpgradedURL(url)));
++    return CANCEL_AND_IGNORE;
++  }
++
++  ThrottleCheckResult WillProcessResponse() override {
++    PendingUpgrades().erase(navigation_handle()->GetWebContents());
++    return PROCEED;
++  }
++
++  ThrottleCheckResult WillFailRequest() override {
++    NavigationHandle* handle = navigation_handle();
++    WebContents* web_contents = handle->GetWebContents();
++    auto it = PendingUpgrades().find(web_contents);
++    if (it == PendingUpgrades().end())
++      return PROCEED;
++    GURL original_http = it->second;
++    // Only fall back if this failed request is the upgrade of that http URL.
++    if (handle->GetURL() != UpgradedURL(original_http))
++      return PROCEED;
++    PendingUpgrades().erase(it);
++
++#if BUILDFLAG(IS_MAC)
++    deferred_http_url_ = original_http;
++    ShellPlatformDelegate::RequestHttpFallbackDecision(
++        web_contents, original_http,
++        base::BindOnce(&HttpsUpgradeThrottle::OnFallbackDecision,
++                       weak_factory_.GetWeakPtr()));
++    return DEFER;
++#else
++    return PROCEED;
++#endif
++  }
++
++ private:
++  static GURL UpgradedURL(const GURL& http_url) {
++    GURL::Replacements replace_scheme;
++    replace_scheme.SetSchemeStr("https");
++    return http_url.ReplaceComponents(replace_scheme);
++  }
++
++  void OnFallbackDecision(bool proceed) {
++    if (proceed) {
++      HttpAllowlist().insert(std::string(deferred_http_url_.host()));
++      WebContents* web_contents = navigation_handle()->GetWebContents();
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&LoadURLOnWebContents,
++                                    web_contents->GetWeakPtr(),
++                                    deferred_http_url_));
++    }
++    CancelDeferredNavigation(CANCEL_AND_IGNORE);
++  }
++
++  GURL deferred_http_url_;
++  base::WeakPtrFactory<HttpsUpgradeThrottle> weak_factory_{this};
++};
++
++}  // namespace
++
+ void ShellContentBrowserClient::CreateThrottlesForNavigation(
+     NavigationThrottleRegistry& registry) {
++  registry.AddThrottle(std::make_unique<HttpsUpgradeThrottle>(registry));
+   if (create_throttles_for_navigation_callback_) {
+     create_throttles_for_navigation_callback_.Run(registry);
+   }
+diff --git a/content/shell/browser/shell_platform_delegate.h b/content/shell/browser/shell_platform_delegate.h
+index 78d832586a..cc1de57844 100644
+--- a/content/shell/browser/shell_platform_delegate.h
++++ b/content/shell/browser/shell_platform_delegate.h
+@@ -153,6 +153,14 @@ class ShellPlatformDelegate {
+       const GURL& url,
+       int cert_error,
+       base::OnceCallback<void(bool)> callback);
++
++  // Shows an "HTTPS not available" interstitial after an http->https upgrade
++  // failed for |http_url|, and runs |callback| with the user's choice (true =
++  // continue to the plain-http URL, false = stay back on safety).
++  static void RequestHttpFallbackDecision(
++      WebContents* web_contents,
++      const GURL& http_url,
++      base::OnceCallback<void(bool)> callback);
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 0f867a43ca..3ee0e8ed46 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -232,6 +232,9 @@ - (void)presentCertErrorForShell:(content::Shell*)shell
+                              url:(const GURL&)url
+                        certError:(int)certError
+                        onResolve:(void (^)(BOOL proceed))resolve;
++- (void)presentHttpFallbackForShell:(content::Shell*)shell
++                                url:(const GURL&)url
++                          onResolve:(void (^)(BOOL proceed))resolve;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1354,6 +1357,40 @@ - (void)presentCertErrorForShell:(content::Shell*)shell
+                      }];
+ }
+ 
++// HTTPS-First fallback: shown when an http->https upgrade failed. Primary (safe)
++// stays back; secondary continues to the plain-http URL.
++- (void)presentHttpFallbackForShell:(content::Shell*)shell
++                                url:(const GURL&)url
++                          onResolve:(void (^)(BOOL proceed))resolve {
++  TabNode* tab = shell ? [self tabForShell:shell] : nil;
++  if (!tab) {
++    if (resolve)
++      resolve(NO);
++    return;
++  }
++  NSString* host = base::SysUTF8ToNSString(url.host());
++  NSString* title = @"This site doesn't support HTTPS";
++  NSString* message = [NSString
++      stringWithFormat:@"%@ couldn't be reached over a secure (HTTPS) "
++                       @"connection. Continuing will load it over unencrypted "
++                       @"HTTP, which others on the network may be able to read.",
++                       host.length ? host : @"This site"];
++  [self presentInterstitialInTab:tab
++                           title:title
++                         message:message
++                          detail:nil
++                     primaryText:@"Back to safety"
++                   secondaryText:@"Continue to HTTP site"
++                       onPrimary:^{
++                         if (resolve)
++                           resolve(NO);
++                       }
++                     onSecondary:^{
++                         if (resolve)
++                           resolve(YES);
++                       }];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2355,6 +2392,26 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+                                    onResolve:resolve];
+ }
+ 
++// static
++void ShellPlatformDelegate::RequestHttpFallbackDecision(
++    WebContents* web_contents,
++    const GURL& http_url,
++    base::OnceCallback<void(bool)> callback) {
++  __block base::OnceCallback<void(bool)> cb = std::move(callback);
++  void (^resolve)(BOOL) = ^(BOOL proceed) {
++    if (cb)
++      std::move(cb).Run(proceed);
++  };
++  Shell* shell = Shell::FromWebContents(web_contents);
++  if (!shell || !g_tab_controller) {
++    resolve(NO);
++    return;
++  }
++  [g_tab_controller presentHttpFallbackForShell:shell
++                                            url:http_url
++                                      onResolve:resolve];
++}
++
+ bool ShellPlatformDelegate::HandleKeyboardEvent(
+     Shell* shell,
+     WebContents* source,
