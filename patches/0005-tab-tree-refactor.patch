@@ -1,0 +1,239 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 86dfb648bb..22fc422aac 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -63,18 +63,33 @@ - (BOOL)isFlipped {
+ }
+ @end
+ 
+-// Bookkeeping for a single tab.
+-@interface TabInfo : NSObject {
++// A node in the tab tree: either a tab or (later) a collapsible folder of tabs.
++// Folders are not created yet — every node is currently a tab — but the fields
++// exist so the folder feature can be added without reworking this model.
++typedef NS_ENUM(NSInteger, TabNodeKind) {
++  TabNodeKindTab = 0,
++  TabNodeKindFolder = 1,
++};
++
++@interface TabNode : NSObject {
+  @public
++  TabNodeKind kind;               // Tab vs. folder.
++  // Tab payload (kind == TabNodeKindTab):
+   raw_ptr<content::Shell> shell;  // Not owned; the Shell is self-owning.
+   __weak NSView* webView;         // Owned by the WebContents / view hierarchy.
++  // Folder payload (kind == TabNodeKindFolder):
++  NSMutableArray<TabNode*>* children;
++  BOOL expanded;
++  NSString* folderTitle;
++  // Shared row UI (both kinds):
+   NSView* rowView;                // The sidebar row container (owned by strip).
+   NSButton* titleButton;
+   NSButton* closeButton;
++  __weak TabNode* parent;         // nil = top level.
+ }
+ @end
+ 
+-@implementation TabInfo
++@implementation TabNode
+ @end
+ 
+ // Owns the single shared browser window and the vertical tab strip. There is
+@@ -93,8 +108,9 @@ @interface TabbedShellController : NSObject <NSWindowDelegate> {
+   NSView* _bookmarkBar;
+   NSButton* _addBookmarkButton;
+   NSMutableArray<NSString*>* _bookmarkURLs;
+-  NSMutableArray<TabInfo*>* _tabs;
+-  TabInfo* _activeTab;
++  NSMutableArray<TabNode*>* _tabs;       // Top-level nodes (roots of the tree).
++  NSMutableArray<TabNode*>* _flatRows;   // Derived render order (DFS of _tabs).
++  TabNode* _activeTab;
+   BOOL _closingAll;
+   BOOL _hideToolbar;
+   // When set, the next tab created is brought to the foreground (used by the
+@@ -107,7 +123,7 @@ - (instancetype)initWithContentSize:(NSSize)size;
+ - (void)addTabForShell:(content::Shell*)shell;
+ - (void)attachContentsForShell:(content::Shell*)shell;
+ - (void)removeTabForShell:(content::Shell*)shell;
+-- (TabInfo*)tabForShell:(content::Shell*)shell;
++- (TabNode*)tabForShell:(content::Shell*)shell;
+ - (content::Shell*)activeShell;
+ - (void)setURLString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell;
+@@ -131,6 +147,7 @@ - (instancetype)initWithContentSize:(NSSize)size {
+     return nil;
+ 
+   _tabs = [[NSMutableArray alloc] init];
++  _flatRows = [[NSMutableArray alloc] init];
+   _bookmarkURLs = [[NSMutableArray alloc] init];
+   _hideToolbar = content::Shell::ShouldHideToolbar();
+ 
+@@ -383,33 +400,75 @@ - (NSButton*)makeToolbarButton:(NSString*)title
+ }
+ 
+ // Positions the New Tab button and all tab rows within the sidebar.
++// Rebuilds _flatRows as the visible top-to-bottom order: a pre-order DFS of the
++// tree that descends into expanded folders only. With no folders yet, this is
++// just a copy of _tabs.
++- (void)rebuildFlatRows {
++  [_flatRows removeAllObjects];
++  [self appendFlatRows:_tabs];
++}
++
++- (void)appendFlatRows:(NSArray<TabNode*>*)nodes {
++  for (TabNode* node in nodes) {
++    [_flatRows addObject:node];
++    if (node->kind == TabNodeKindFolder && node->expanded && node->children)
++      [self appendFlatRows:node->children];
++  }
++}
++
+ - (void)layoutTabRows {
++  [self rebuildFlatRows];
+   _newTabButton.frame = NSMakeRect(0, 0, kSidebarWidth, kTabRowHeight);
+   CGFloat y = kTabRowHeight;
+-  for (TabInfo* tab in _tabs) {
+-    tab->rowView.frame = NSMakeRect(0, y, kSidebarWidth, kTabRowHeight);
+-    tab->titleButton.frame =
++  for (TabNode* node in _flatRows) {
++    node->rowView.frame = NSMakeRect(0, y, kSidebarWidth, kTabRowHeight);
++    node->titleButton.frame =
+         NSMakeRect(0, 0, kSidebarWidth - kCloseButtonWidth, kTabRowHeight);
+-    tab->closeButton.frame = NSMakeRect(kSidebarWidth - kCloseButtonWidth, 0,
+-                                        kCloseButtonWidth, kTabRowHeight);
++    node->closeButton.frame = NSMakeRect(kSidebarWidth - kCloseButtonWidth, 0,
++                                         kCloseButtonWidth, kTabRowHeight);
+     y += kTabRowHeight;
+   }
+ }
+ 
+-- (TabInfo*)tabForShell:(content::Shell*)shell {
+-  for (TabInfo* tab in _tabs) {
+-    if (tab->shell == shell)
+-      return tab;
++- (TabNode*)tabForShell:(content::Shell*)shell {
++  return [self findShell:shell in:_tabs];
++}
++
++- (TabNode*)findShell:(content::Shell*)shell in:(NSArray<TabNode*>*)nodes {
++  for (TabNode* node in nodes) {
++    if (node->kind == TabNodeKindTab && node->shell == shell)
++      return node;
++    if (node->children) {
++      TabNode* found = [self findShell:shell in:node->children];
++      if (found)
++        return found;
++    }
+   }
+   return nil;
+ }
+ 
++// Total number of tab (non-folder) nodes anywhere in the tree.
++- (NSUInteger)tabNodeCount {
++  return [self countTabsIn:_tabs];
++}
++
++- (NSUInteger)countTabsIn:(NSArray<TabNode*>*)nodes {
++  NSUInteger count = 0;
++  for (TabNode* node in nodes) {
++    if (node->kind == TabNodeKindTab)
++      ++count;
++    if (node->children)
++      count += [self countTabsIn:node->children];
++  }
++  return count;
++}
++
+ - (content::Shell*)activeShell {
+   return _activeTab ? _activeTab->shell : nullptr;
+ }
+ 
+ - (void)addTabForShell:(content::Shell*)shell {
+-  TabInfo* tab = [[TabInfo alloc] init];
++  TabNode* tab = [[TabNode alloc] init];
+   tab->shell = shell;
+ 
+   tab->rowView = [[NSView alloc] initWithFrame:NSZeroRect];
+@@ -472,7 +531,7 @@ - (void)flashSidebar {
+ }
+ 
+ - (void)attachContentsForShell:(content::Shell*)shell {
+-  TabInfo* tab = [self tabForShell:shell];
++  TabNode* tab = [self tabForShell:shell];
+   if (!tab)
+     return;
+   NSView* webView = shell->web_contents()->GetNativeView().GetNativeNSView();
+@@ -487,7 +546,7 @@ - (void)attachContentsForShell:(content::Shell*)shell {
+     shell->web_contents()->WasHidden();
+ }
+ 
+-- (void)activateTab:(TabInfo*)tab {
++- (void)activateTab:(TabNode*)tab {
+   if (!tab || tab == _activeTab)
+     return;
+ 
+@@ -520,7 +579,7 @@ - (void)activateTab:(TabInfo*)tab {
+ - (void)removeTabForShell:(content::Shell*)shell {
+   if (_closingAll)
+     return;
+-  TabInfo* tab = [self tabForShell:shell];
++  TabNode* tab = [self tabForShell:shell];
+   if (!tab)
+     return;
+ 
+@@ -540,7 +599,7 @@ - (void)removeTabForShell:(content::Shell*)shell {
+   }
+   [self layoutTabRows];
+ 
+-  if (_tabs.count == 0) {
++  if ([self tabNodeCount] == 0) {
+     // The last tab closed; tear down the window. The Shell teardown that called
+     // us will fire DidCloseLastWindow() -> Shell::Shutdown() to quit the app.
+     _window.delegate = nil;
+@@ -557,7 +616,7 @@ - (void)setURLString:(NSString*)s forShell:(content::Shell*)shell {
+ }
+ 
+ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell {
+-  TabInfo* tab = [self tabForShell:shell];
++  TabNode* tab = [self tabForShell:shell];
+   if (!tab)
+     return;
+   tab->titleButton.title = s.length ? s : @"Untitled";
+@@ -614,7 +673,7 @@ - (void)newTab:(id)sender {
+ }
+ 
+ - (void)tabClicked:(id)sender {
+-  for (TabInfo* tab in _tabs) {
++  for (TabNode* tab in _tabs) {
+     if (tab->titleButton == sender) {
+       [self activateTab:tab];
+       if (tab->shell)
+@@ -625,7 +684,7 @@ - (void)tabClicked:(id)sender {
+ }
+ 
+ - (void)closeTabButton:(id)sender {
+-  for (TabInfo* tab in _tabs) {
++  for (TabNode* tab in _tabs) {
+     if (tab->closeButton == sender) {
+       content::Shell* shell = tab->shell;
+       // Close() deletes the Shell, which calls back into removeTabForShell:.
+@@ -643,8 +702,8 @@ - (BOOL)windowShouldClose:(id)sender {
+   // Closing the window closes every tab. Close()->~Shell()->removeTabForShell:
+   // is suppressed by _closingAll so we can tear down deterministically here.
+   _closingAll = YES;
+-  NSArray<TabInfo*>* snapshot = [_tabs copy];
+-  for (TabInfo* tab in snapshot) {
++  NSArray<TabNode*>* snapshot = [_tabs copy];
++  for (TabNode* tab in snapshot) {
+     content::Shell* shell = tab->shell;
+     tab->shell = nullptr;
+     if (shell)
+@@ -749,7 +808,7 @@ - (BOOL)windowShouldClose:(id)sender {
+ 
+ void ShellPlatformDelegate::ActivateContents(Shell* shell,
+                                              WebContents* top_contents) {
+-  TabInfo* tab = [g_tab_controller tabForShell:shell];
++  TabNode* tab = [g_tab_controller tabForShell:shell];
+   if (tab)
+     [g_tab_controller activateTab:tab];
+   top_contents->Focus();
