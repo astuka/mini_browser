@@ -1,0 +1,438 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 25cd26e8ec..31a4d03694 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -357,6 +357,7 @@ static_library("content_shell_lib") {
+     "//content/public/common",
+     "//content/test:content_test_mojo_bindings",
+     "//content/test:test_support",
++    "//crypto",
+     "//device/bluetooth",
+     "//media",
+     "//media/mojo:buildflags",
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 2032dcdb38..fef9e306f6 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -171,6 +171,13 @@ inline constexpr char kSession[] = "content_shell.session";
+ // state keyed by origin (see GetSitePermission / SetSitePermission).
+ inline constexpr char kSiteSettings[] = "content_shell.site_settings";
+ 
++// Installed extensions, persisted as a JSON dict in local state keyed by
++// extension id (see GetExtensions / SetExtensions). Each value records the
++// parsed manifest essentials (path, name, version, enabled, permissions) so the
++// browser can reload them on launch. This is our own mini extension registry,
++// built directly on content_shell rather than //chrome/browser/extensions.
++inline constexpr char kExtensions[] = "content_shell.extensions";
++
+ using PerformanceManagerRegistry =
+     performance_manager::PerformanceManagerRegistry;
+ 
+@@ -312,6 +319,7 @@ std::unique_ptr<PrefService> CreateLocalState() {
+   pref_registry->RegisterDictionaryPref(kBookmarks);
+   pref_registry->RegisterDictionaryPref(kSession);
+   pref_registry->RegisterDictionaryPref(kSiteSettings);
++  pref_registry->RegisterDictionaryPref(kExtensions);
+ 
+ #if BUILDFLAG(IS_IOS)
+   pref_registry->RegisterBooleanPref(kJITEnabled, true);
+@@ -516,6 +524,15 @@ void ShellContentBrowserClient::SetSession(base::DictValue session) {
+   GetSharedState().local_state->CommitPendingWrite();
+ }
+ 
++base::DictValue ShellContentBrowserClient::GetExtensions() {
++  return GetSharedState().local_state->GetDict(kExtensions).Clone();
++}
++
++void ShellContentBrowserClient::SetExtensions(base::DictValue extensions) {
++  GetSharedState().local_state->SetDict(kExtensions, std::move(extensions));
++  GetSharedState().local_state->CommitPendingWrite();
++}
++
+ std::optional<bool> ShellContentBrowserClient::GetSitePermission(
+     const std::string& origin,
+     const std::string& key) {
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index 053b164416..9c80680c43 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -240,6 +240,14 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+                          const std::string& key,
+                          bool allow);
+ 
++  // Installed-extensions registry, backed by a JSON dict in local state keyed by
++  // extension id. Returns a copy; SetExtensions replaces the stored dict and
++  // flushes to disk. Used by the browser UI (Extensions manager) to list, load,
++  // enable/disable, and remove extensions. This is our own mini extension
++  // runtime, built on content_shell rather than //chrome/browser/extensions.
++  base::DictValue GetExtensions();
++  void SetExtensions(base::DictValue extensions);
++
+  protected:
+   // Call this if CreateBrowserMainParts() is overridden in a subclass.
+   void set_browser_main_parts(ShellBrowserMainParts* parts);
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 8d5d0ab0e0..d1976351fb 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -19,11 +19,15 @@
+ #import "base/apple/foundation_util.h"
+ #include "base/check_op.h"
+ #include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/process/process.h"
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/threading/thread_restrictions.h"
+ #include "base/values.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "content/public/browser/browser_context.h"
+@@ -40,6 +44,7 @@
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "crypto/sha2.h"
+ #include "base/time/time.h"
+ #include "net/cert/cert_status_flags.h"
+ #include "net/cert/x509_cert_types.h"
+@@ -216,6 +221,8 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   TabNode* _restoreActiveTab;            // Saved active tab, activated post-restore.
+   BOOL _closingAll;
+   BOOL _hideToolbar;
++  NSWindow* _extensionsPanel;            // Extensions manager window (⌘⇧E).
++  FlippedView* _extensionsListView;      // Scrollable list inside the panel.
+   // When set, the next tab created is brought to the foreground (used by the
+   // "+ New Tab" button). Link/script-opened tabs (e.g. cmd+click) stay in the
+   // background and flash the strip instead.
+@@ -250,6 +257,7 @@ - (void)presentPermissionPromptForShell:(content::Shell*)shell
+ - (void)presentDownloadWarningForFilename:(NSString*)filename
+                                 onResolve:(void (^)(BOOL keep))resolve;
+ - (void)showSecurityDiagnostics;
++- (void)showExtensionsManager;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -1643,6 +1651,305 @@ - (void)showSecurityDiagnostics {
+                 }];
+ }
+ 
++#pragma mark - Extensions (Graft epic, E1)
++
++// Derive an extension id from its on-disk path, mirroring Chrome's scheme for
++// unpacked extensions: SHA-256 of the path, take the first 16 bytes, and map
++// each nibble to the letters 'a'..'p' (giving a 32-char id). Deterministic per
++// path, so re-loading the same folder updates the same entry.
++- (NSString*)extensionIdForPath:(NSString*)path {
++  std::string hash =
++      crypto::SHA256HashString(base::SysNSStringToUTF8(path));
++  NSMutableString* extId = [NSMutableString stringWithCapacity:32];
++  for (int i = 0; i < 16; ++i) {
++    uint8_t byte = static_cast<uint8_t>(hash[i]);
++    [extId appendFormat:@"%c", 'a' + ((byte >> 4) & 0xf)];
++    [extId appendFormat:@"%c", 'a' + (byte & 0xf)];
++  }
++  return extId;
++}
++
++- (void)showExtensionError:(NSString*)message {
++  NSAlert* alert = [[NSAlert alloc] init];
++  alert.messageText = @"Couldn't load extension";
++  alert.informativeText = message;
++  alert.alertStyle = NSAlertStyleWarning;
++  [alert addButtonWithTitle:@"OK"];
++  NSWindow* host =
++      (_extensionsPanel && _extensionsPanel.isVisible) ? _extensionsPanel
++                                                       : _window;
++  if (host) {
++    [alert beginSheetModalForWindow:host
++                  completionHandler:^(NSModalResponse response){
++                  }];
++  } else {
++    [alert runModal];
++  }
++}
++
++// Read and parse <dir>/manifest.json, validate the MV3 essentials, and register
++// the extension in our persisted store. No execution happens in E1 — this only
++// records what the extension *is*.
++- (void)installExtensionFromDirectory:(NSString*)dir {
++  // Reading the manifest is a small, synchronous, user-initiated file read on
++  // the UI thread (the user just picked the folder in an open panel), so allow
++  // blocking here. content_shell is a test shell; a future PR that serves
++  // chrome-extension:// resources will move file I/O off-thread properly.
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  NSString* manifestPath =
++      [dir stringByAppendingPathComponent:@"manifest.json"];
++  std::string contents;
++  base::FilePath fp(base::SysNSStringToUTF8(manifestPath));
++  if (!base::ReadFileToString(fp, &contents)) {
++    [self showExtensionError:@"That folder has no readable manifest.json."];
++    return;
++  }
++  std::optional<base::Value> parsed = base::JSONReader::Read(
++      contents, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  if (!parsed || !parsed->is_dict()) {
++    [self showExtensionError:@"manifest.json is not valid JSON."];
++    return;
++  }
++  const base::DictValue& manifest = parsed->GetDict();
++  const std::string* name = manifest.FindString("name");
++  const std::string* version = manifest.FindString("version");
++  if (!name || !version) {
++    [self showExtensionError:
++              @"manifest.json is missing a \"name\" or \"version\"."];
++    return;
++  }
++
++  base::DictValue entry;
++  entry.Set("path", base::SysNSStringToUTF8(dir));
++  entry.Set("name", *name);
++  entry.Set("version", *version);
++  if (const std::string* desc = manifest.FindString("description"))
++    entry.Set("description", *desc);
++  if (std::optional<int> mv = manifest.FindInt("manifest_version"))
++    entry.Set("manifest_version", *mv);
++  entry.Set("enabled", true);
++  if (const base::ListValue* perms = manifest.FindList("permissions"))
++    entry.Set("permissions", perms->Clone());
++  if (const base::ListValue* hosts = manifest.FindList("host_permissions"))
++    entry.Set("host_permissions", hosts->Clone());
++
++  NSString* extId = [self extensionIdForPath:dir];
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue extensions = client->GetExtensions();
++  extensions.Set(base::SysNSStringToUTF8(extId), std::move(entry));
++  client->SetExtensions(std::move(extensions));
++  [self rebuildExtensionsList];
++}
++
++- (void)loadUnpackedExtension:(id)sender {
++  NSOpenPanel* panel = [NSOpenPanel openPanel];
++  panel.canChooseFiles = NO;
++  panel.canChooseDirectories = YES;
++  panel.allowsMultipleSelection = NO;
++  panel.prompt = @"Load";
++  panel.message = @"Choose an unpacked extension folder (with a manifest.json)";
++  NSWindow* host = _extensionsPanel ?: _window;
++  __weak TabbedShellController* weakSelf = self;
++  void (^handler)(NSModalResponse) = ^(NSModalResponse result) {
++    if (result != NSModalResponseOK || panel.URLs.count == 0)
++      return;
++    [weakSelf installExtensionFromDirectory:panel.URLs.firstObject.path];
++  };
++  if (host)
++    [panel beginSheetModalForWindow:host completionHandler:handler];
++  else
++    handler([panel runModal]);
++}
++
++- (void)toggleExtensionEnabled:(NSButton*)sender {
++  NSString* extId = sender.identifier;
++  if (!extId.length)
++    return;
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue extensions = client->GetExtensions();
++  if (base::DictValue* e =
++          extensions.FindDict(base::SysNSStringToUTF8(extId))) {
++    e->Set("enabled", sender.state == NSControlStateValueOn);
++    client->SetExtensions(std::move(extensions));
++  }
++  [self rebuildExtensionsList];
++}
++
++- (void)removeExtension:(NSButton*)sender {
++  NSString* extId = sender.identifier;
++  if (!extId.length)
++    return;
++  content::ShellContentBrowserClient* client =
++      content::ShellContentBrowserClient::Get();
++  base::DictValue extensions = client->GetExtensions();
++  extensions.Remove(base::SysNSStringToUTF8(extId));
++  client->SetExtensions(std::move(extensions));
++  [self rebuildExtensionsList];
++}
++
++// A non-editable, borderless label used in the extensions list.
++- (NSTextField*)makeExtLabel:(NSString*)text frame:(NSRect)frame {
++  NSTextField* label = [[NSTextField alloc] initWithFrame:frame];
++  label.stringValue = text;
++  label.editable = NO;
++  label.selectable = NO;
++  label.bordered = NO;
++  label.drawsBackground = NO;
++  label.font = [NSFont systemFontOfSize:11];
++  label.textColor = NSColor.secondaryLabelColor;
++  label.lineBreakMode = NSLineBreakByTruncatingTail;
++  return label;
++}
++
++// Rebuild the rows in the extensions list from the persisted store.
++- (void)rebuildExtensionsList {
++  if (!_extensionsListView)
++    return;
++  for (NSView* sub in [_extensionsListView.subviews copy])
++    [sub removeFromSuperview];
++
++  base::DictValue extensions =
++      content::ShellContentBrowserClient::Get()->GetExtensions();
++  CGFloat width = NSWidth(_extensionsListView.frame);
++  CGFloat y = 0;
++
++  if (extensions.empty()) {
++    NSTextField* empty = [self
++        makeExtLabel:@"No extensions loaded. Click “Load Unpacked…” below."
++               frame:NSMakeRect(16, 16, width - 32, 20)];
++    [_extensionsListView addSubview:empty];
++    y = 52;
++  } else {
++    const CGFloat rowH = 76;
++    for (auto&& [idKey, value] : extensions) {
++      if (!value.is_dict())
++        continue;
++      const base::DictValue& e = value.GetDict();
++      NSString* extId = base::SysUTF8ToNSString(idKey);
++      const std::string* name = e.FindString("name");
++      const std::string* version = e.FindString("version");
++      const std::string* desc = e.FindString("description");
++      const std::string* path = e.FindString("path");
++      bool enabled = e.FindBool("enabled").value_or(true);
++
++      // Enable/disable checkbox.
++      NSButton* check = [NSButton checkboxWithTitle:@""
++                                             target:self
++                                             action:@selector
++                                             (toggleExtensionEnabled:)];
++      check.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
++      check.frame = NSMakeRect(14, y + 12, 18, 18);
++      check.identifier = extId;
++      [_extensionsListView addSubview:check];
++
++      // Name + version (bold; dimmed when disabled).
++      NSString* nm = name ? base::SysUTF8ToNSString(*name) : @"(unknown)";
++      NSString* ver = version ? base::SysUTF8ToNSString(*version) : @"?";
++      NSTextField* titleLabel = [self
++          makeExtLabel:[NSString stringWithFormat:@"%@  v%@", nm, ver]
++                 frame:NSMakeRect(40, y + 8, width - 140, 18)];
++      titleLabel.font = [NSFont boldSystemFontOfSize:13];
++      titleLabel.textColor =
++          enabled ? NSColor.labelColor : NSColor.tertiaryLabelColor;
++      [_extensionsListView addSubview:titleLabel];
++
++      // Description (if any).
++      if (desc && !desc->empty()) {
++        NSTextField* descLabel =
++            [self makeExtLabel:base::SysUTF8ToNSString(*desc)
++                         frame:NSMakeRect(40, y + 28, width - 60, 16)];
++        [_extensionsListView addSubview:descLabel];
++      }
++
++      // Extension id + path (small, gray).
++      NSString* pathStr = path ? base::SysUTF8ToNSString(*path) : @"";
++      NSTextField* metaLabel = [self
++          makeExtLabel:[NSString stringWithFormat:@"%@ · %@", extId, pathStr]
++                 frame:NSMakeRect(40, y + 46, width - 60, 16)];
++      metaLabel.font = [NSFont monospacedSystemFontOfSize:9
++                                                   weight:NSFontWeightRegular];
++      metaLabel.textColor = NSColor.tertiaryLabelColor;
++      [_extensionsListView addSubview:metaLabel];
++
++      // Remove button.
++      NSButton* rm = [NSButton buttonWithTitle:@"Remove"
++                                        target:self
++                                        action:@selector(removeExtension:)];
++      rm.frame = NSMakeRect(width - 92, y + 12, 80, 24);
++      rm.bezelStyle = NSBezelStyleRounded;
++      rm.controlSize = NSControlSizeSmall;
++      rm.identifier = extId;
++      rm.autoresizingMask = NSViewMinXMargin;
++      [_extensionsListView addSubview:rm];
++
++      // Separator.
++      NSBox* sep = [[NSBox alloc]
++          initWithFrame:NSMakeRect(12, y + rowH - 1, width - 24, 1)];
++      sep.boxType = NSBoxSeparator;
++      sep.autoresizingMask = NSViewWidthSizable;
++      [_extensionsListView addSubview:sep];
++
++      y += rowH;
++    }
++  }
++
++  // Size the flipped document view so the scroll view scrolls correctly.
++  CGFloat minH = _extensionsListView.enclosingScrollView
++                     ? NSHeight(_extensionsListView.enclosingScrollView
++                                    .contentView.bounds)
++                     : y;
++  _extensionsListView.frame =
++      NSMakeRect(0, 0, width, MAX(y, minH));
++}
++
++// Shown via ⌘⇧E. A simple management window: load unpacked extensions,
++// enable/disable, and remove. No execution yet (E1 of the Graft epic).
++- (void)showExtensionsManager {
++  if (!_extensionsPanel) {
++    NSRect frame = NSMakeRect(0, 0, 480, 440);
++    _extensionsPanel = [[NSWindow alloc]
++        initWithContentRect:frame
++                  styleMask:(NSWindowStyleMaskTitled |
++                             NSWindowStyleMaskClosable |
++                             NSWindowStyleMaskResizable)
++                    backing:NSBackingStoreBuffered
++                      defer:NO];
++    _extensionsPanel.title = @"Extensions";
++    _extensionsPanel.releasedWhenClosed = NO;
++    [_extensionsPanel setFrameAutosaveName:@"MiniBrowserExtensionsPanel"];
++
++    NSView* contentView = _extensionsPanel.contentView;
++
++    NSButton* loadBtn =
++        [NSButton buttonWithTitle:@"Load Unpacked…"
++                           target:self
++                           action:@selector(loadUnpackedExtension:)];
++    loadBtn.frame = NSMakeRect(12, 12, 150, 30);
++    loadBtn.bezelStyle = NSBezelStyleRounded;
++    loadBtn.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
++    [contentView addSubview:loadBtn];
++
++    NSScrollView* scroll = [[NSScrollView alloc]
++        initWithFrame:NSMakeRect(0, 54, frame.size.width,
++                                 frame.size.height - 54)];
++    scroll.hasVerticalScroller = YES;
++    scroll.borderType = NSNoBorder;
++    scroll.drawsBackground = NO;
++    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++    _extensionsListView = [[FlippedView alloc]
++        initWithFrame:NSMakeRect(0, 0, frame.size.width, 100)];
++    _extensionsListView.autoresizingMask = NSViewWidthSizable;
++    scroll.documentView = _extensionsListView;
++    [contentView addSubview:scroll];
++
++    [_extensionsPanel center];
++  }
++  [self rebuildExtensionsList];
++  [_extensionsPanel makeKeyAndOrderFront:nil];
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);
+@@ -2754,6 +3061,13 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+       [g_tab_controller showSecurityDiagnostics];
+       return true;
+     }
++    // ⌘⇧E → Extensions manager.
++    if ((ns_event.modifierFlags & NSEventModifierFlagCommand) &&
++        (ns_event.modifierFlags & NSEventModifierFlagShift) &&
++        [ns_event.charactersIgnoringModifiers.lowercaseString isEqual:@"e"]) {
++      [g_tab_controller showExtensionsManager];
++      return true;
++    }
+     [NSApp.mainMenu performKeyEquivalent:ns_event];
+     return true;
+   }
