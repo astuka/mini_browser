@@ -1,0 +1,319 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index d1976351fb..a35936c7dc 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -32,6 +32,8 @@
+ #include "components/input/native_web_keyboard_event.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/common/referrer.h"
++#include "ui/base/page_transition_types.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
+@@ -223,6 +225,10 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   BOOL _hideToolbar;
+   NSWindow* _extensionsPanel;            // Extensions manager window (⌘⇧E).
+   FlippedView* _extensionsListView;      // Scrollable list inside the panel.
++  NSMutableArray<NSButton*>* _extensionActionButtons;  // Toolbar action icons.
++  NSPanel* _extPopupPanel;               // The open extension action popup, if any.
++  std::unique_ptr<content::WebContents> _popupContents;  // Popup's web contents.
++  id _popupCloseObserver;                // NSWindowWillClose observer for popup.
+   // When set, the next tab created is brought to the foreground (used by the
+   // "+ New Tab" button). Link/script-opened tabs (e.g. cmd+click) stay in the
+   // background and flash the strip instead.
+@@ -258,6 +264,16 @@ - (void)presentDownloadWarningForFilename:(NSString*)filename
+                                 onResolve:(void (^)(BOOL keep))resolve;
+ - (void)showSecurityDiagnostics;
+ - (void)showExtensionsManager;
++// Extension action icons + popups (E4):
++- (void)rebuildExtensionActions;
++- (NSString*)pathForExtensionId:(NSString*)extId;
++- (std::optional<base::Value>)readManifestForExtensionId:(NSString*)extId;
++- (NSImage*)iconForAction:(const base::DictValue*)action
++              extensionId:(NSString*)extId;
++- (void)extensionActionClicked:(NSButton*)sender;
++- (void)showExtensionPopupForURL:(const GURL&)url anchor:(NSView*)anchor;
++- (void)onExtensionPopupClosed;
++- (void)closeExtensionPopup;
+ - (void)focusURLField;
+ // Row interaction, called from TabRowView / TabTitleButton:
+ - (void)restoreSessionWithPlaceholder:(content::Shell*)placeholder;
+@@ -292,6 +308,7 @@ - (instancetype)initWithContentSize:(NSSize)size {
+   _flatRows = [[NSMutableArray alloc] init];
+   _selection = [[NSMutableArray alloc] init];
+   _bookmarkURLs = [[NSMutableArray alloc] init];
++  _extensionActionButtons = [[NSMutableArray alloc] init];
+   // Don't persist the session until the initial restore pass has run; otherwise
+   // the placeholder startup tab would overwrite the saved session before we read
+   // it.
+@@ -421,6 +438,7 @@ - (instancetype)initWithContentSize:(NSSize)size {
+     [_bookmarkBar addSubview:_addBookmarkButton];
+ 
+     [self rebuildBookmarkBar];
++    [self rebuildExtensionActions];
+   }
+ 
+   [_window makeKeyAndOrderFront:nil];
+@@ -433,7 +451,8 @@ - (void)rebuildBookmarkBar {
+   if (!_bookmarkBar)
+     return;
+   for (NSView* v in [_bookmarkBar.subviews copy]) {
+-    if (v != _addBookmarkButton)
++    if (v != _addBookmarkButton &&
++        ![_extensionActionButtons containsObject:(id)v])
+       [v removeFromSuperview];
+   }
+   [_bookmarkURLs removeAllObjects];
+@@ -1740,6 +1759,7 @@ - (void)installExtensionFromDirectory:(NSString*)dir {
+   extensions.Set(base::SysNSStringToUTF8(extId), std::move(entry));
+   client->SetExtensions(std::move(extensions));
+   [self rebuildExtensionsList];
++  [self rebuildExtensionActions];
+ }
+ 
+ - (void)loadUnpackedExtension:(id)sender {
+@@ -1775,6 +1795,7 @@ - (void)toggleExtensionEnabled:(NSButton*)sender {
+     client->SetExtensions(std::move(extensions));
+   }
+   [self rebuildExtensionsList];
++  [self rebuildExtensionActions];
+ }
+ 
+ - (void)removeExtension:(NSButton*)sender {
+@@ -1787,6 +1808,7 @@ - (void)removeExtension:(NSButton*)sender {
+   extensions.Remove(base::SysNSStringToUTF8(extId));
+   client->SetExtensions(std::move(extensions));
+   [self rebuildExtensionsList];
++  [self rebuildExtensionActions];
+ }
+ 
+ // A non-editable, borderless label used in the extensions list.
+@@ -1950,6 +1972,227 @@ - (void)showExtensionsManager {
+   [_extensionsPanel makeKeyAndOrderFront:nil];
+ }
+ 
++#pragma mark - Extension actions / popups (Graft epic, E4)
++
++// The on-disk root for an installed extension, or nil.
++- (NSString*)pathForExtensionId:(NSString*)extId {
++  base::DictValue exts =
++      content::ShellContentBrowserClient::Get()->GetExtensions();
++  const base::DictValue* e = exts.FindDict(base::SysNSStringToUTF8(extId));
++  if (!e)
++    return nil;
++  const std::string* p = e->FindString("path");
++  return p ? base::SysUTF8ToNSString(*p) : nil;
++}
++
++// Re-reads + parses an installed extension's manifest.json (its `action` block
++// isn't kept in the store). Small, user-triggered read on the UI thread.
++- (std::optional<base::Value>)readManifestForExtensionId:(NSString*)extId {
++  NSString* root = [self pathForExtensionId:extId];
++  if (!root)
++    return std::nullopt;
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  std::string contents;
++  base::FilePath fp(base::SysNSStringToUTF8(
++      [root stringByAppendingPathComponent:@"manifest.json"]));
++  if (!base::ReadFileToString(fp, &contents))
++    return std::nullopt;
++  return base::JSONReader::Read(contents,
++                                base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++}
++
++// Loads an action's default_icon (string or {size: path} dict) from disk.
++- (NSImage*)iconForAction:(const base::DictValue*)action
++              extensionId:(NSString*)extId {
++  const base::Value* default_icon = action->Find("default_icon");
++  std::string icon_rel;
++  if (default_icon) {
++    if (default_icon->is_string()) {
++      icon_rel = default_icon->GetString();
++    } else if (default_icon->is_dict()) {
++      const base::DictValue& sizes = default_icon->GetDict();
++      for (const char* key : {"32", "48", "16", "128"}) {
++        if (const std::string* p = sizes.FindString(key)) {
++          icon_rel = *p;
++          break;
++        }
++      }
++      if (icon_rel.empty()) {
++        for (auto&& [k, v] : sizes) {
++          if (v.is_string()) {
++            icon_rel = v.GetString();
++            break;
++          }
++        }
++      }
++    }
++  }
++  if (icon_rel.empty())
++    return nil;
++  NSString* root = [self pathForExtensionId:extId];
++  if (!root)
++    return nil;
++  NSString* full = [root
++      stringByAppendingPathComponent:base::SysUTF8ToNSString(icon_rel)];
++  return [[NSImage alloc] initWithContentsOfFile:full];
++}
++
++// Rebuilds the extension action icons on the right of the bookmark bar (one per
++// enabled extension that declares an `action`). Click opens its popup.
++- (void)rebuildExtensionActions {
++  if (!_bookmarkBar)
++    return;
++  for (NSButton* b in _extensionActionButtons)
++    [b removeFromSuperview];
++  [_extensionActionButtons removeAllObjects];
++
++  base::DictValue exts =
++      content::ShellContentBrowserClient::Get()->GetExtensions();
++  const CGFloat actionWidth = 28;
++  const CGFloat addButtonWidth = 32;
++  CGFloat x = NSWidth(_bookmarkBar.frame) - addButtonWidth - 4 - actionWidth;
++
++  for (auto&& [id_key, value] : exts) {
++    if (!value.is_dict())
++      continue;
++    const base::DictValue& dict = value.GetDict();
++    if (!dict.FindBool("enabled").value_or(true))
++      continue;
++    NSString* extId = base::SysUTF8ToNSString(id_key);
++    std::optional<base::Value> manifest =
++        [self readManifestForExtensionId:extId];
++    if (!manifest || !manifest->is_dict())
++      continue;
++    const base::DictValue* action = manifest->GetDict().FindDict("action");
++    if (!action)
++      continue;  // No browser action -> no toolbar icon.
++
++    NSButton* button = [[NSButton alloc]
++        initWithFrame:NSMakeRect(x, (kBookmarkBarHeight - 22) / 2, actionWidth,
++                                 22)];
++    button.bezelStyle = NSBezelStyleSmallSquare;
++    button.bordered = NO;
++    button.imagePosition = NSImageOnly;
++    button.imageScaling = NSImageScaleProportionallyUpOrDown;
++    button.identifier = extId;
++    button.target = self;
++    button.action = @selector(extensionActionClicked:);
++    button.autoresizingMask = NSViewMinXMargin;
++
++    const std::string* title = action->FindString("default_title");
++    const std::string* name = manifest->GetDict().FindString("name");
++    button.toolTip = base::SysUTF8ToNSString(
++        (title && !title->empty()) ? *title : (name ? *name : std::string()));
++
++    NSImage* icon = [self iconForAction:action extensionId:extId];
++    if (icon) {
++      icon.size = NSMakeSize(16, 16);
++      button.image = icon;
++    } else if (@available(macOS 11.0, *)) {
++      button.image =
++          [NSImage imageWithSystemSymbolName:@"puzzlepiece.extension.fill"
++                   accessibilityDescription:button.toolTip];
++    } else {
++      button.title = @"E";
++      button.imagePosition = NSNoImage;
++    }
++
++    [_bookmarkBar addSubview:button];
++    [_extensionActionButtons addObject:button];
++    x -= (actionWidth + 4);
++  }
++}
++
++- (void)extensionActionClicked:(NSButton*)sender {
++  NSString* extId = sender.identifier;
++  if (!extId.length)
++    return;
++  std::optional<base::Value> manifest =
++      [self readManifestForExtensionId:extId];
++  if (!manifest || !manifest->is_dict())
++    return;
++  const base::DictValue* action = manifest->GetDict().FindDict("action");
++  if (!action)
++    return;
++  const std::string* popup = action->FindString("default_popup");
++  if (!popup || popup->empty()) {
++    // No popup page. A real action would fire chrome.action.onClicked here,
++    // which arrives with the chrome.* API bridge (E5).
++    return;
++  }
++  GURL url("chrome-extension://" + base::SysNSStringToUTF8(extId) + "/" +
++           *popup);
++  [self showExtensionPopupForURL:url anchor:sender];
++}
++
++// Hosts an extension popup page in a small floating panel anchored to the
++// clicked action button. The popup runs in its own WebContents at the
++// extension's privileged chrome-extension:// origin.
++- (void)showExtensionPopupForURL:(const GURL&)url anchor:(NSView*)anchor {
++  [self closeExtensionPopup];
++
++  content::Shell* active = [self activeShell];
++  content::BrowserContext* browser_context =
++      active ? active->web_contents()->GetBrowserContext() : nullptr;
++  if (!browser_context)
++    return;
++
++  content::WebContents::CreateParams params(browser_context);
++  _popupContents = content::WebContents::Create(params);
++  _popupContents->GetController().LoadURL(url, content::Referrer(),
++                                          ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++                                          std::string());
++
++  const CGFloat w = 360, h = 480;
++  NSPanel* panel = [[NSPanel alloc]
++      initWithContentRect:NSMakeRect(0, 0, w, h)
++                styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
++                           NSWindowStyleMaskUtilityWindow)
++                  backing:NSBackingStoreBuffered
++                    defer:NO];
++  panel.title = @"Extension";
++  panel.releasedWhenClosed = NO;
++
++  NSView* view = _popupContents->GetNativeView().GetNativeNSView();
++  view.frame = [panel.contentView bounds];
++  view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++  [panel.contentView addSubview:view];
++  _popupContents->WasShown();
++
++  // Position the panel just below the action button.
++  NSRect screenRect = [anchor.window
++      convertRectToScreen:[anchor convertRect:anchor.bounds toView:nil]];
++  [panel setFrameOrigin:NSMakePoint(NSMinX(screenRect),
++                                    NSMinY(screenRect) - h - 4)];
++
++  // Clean up if the user closes the panel (avoids touching windowShouldClose:,
++  // which is reserved for the main window's teardown).
++  __weak TabbedShellController* weakSelf = self;
++  _popupCloseObserver = [[NSNotificationCenter defaultCenter]
++      addObserverForName:NSWindowWillCloseNotification
++                  object:panel
++                   queue:nil
++              usingBlock:^(NSNotification* note) {
++                [weakSelf onExtensionPopupClosed];
++              }];
++  _extPopupPanel = panel;
++  [panel makeKeyAndOrderFront:nil];
++}
++
++- (void)onExtensionPopupClosed {
++  if (_popupCloseObserver) {
++    [[NSNotificationCenter defaultCenter] removeObserver:_popupCloseObserver];
++    _popupCloseObserver = nil;
++  }
++  _popupContents.reset();
++  _extPopupPanel = nil;
++}
++
++- (void)closeExtensionPopup {
++  if (_extPopupPanel)
++    [_extPopupPanel close];  // -> onExtensionPopupClosed handles teardown.
++}
++
+ - (void)navAction:(id)sender {
+   if (content::Shell* shell = [self activeShell])
+     shell->ActionPerformed([sender tag]);

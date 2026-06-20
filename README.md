@@ -90,8 +90,10 @@ Run it:
   the extension's on-disk root under a real `chrome-extension://<id>` origin, with path-traversal
   rejected; and **content-script injection** — an extension's `content_scripts` run on matching
   pages, injected into an isolated world (a renderer-side `RenderFrameObserver` matches the page URL
-  against the manifest patterns and injects at the right `run_at`). (The `chrome.*` API surface and
-  background service workers come next.)
+  against the manifest patterns and injects at the right `run_at`); and **extension action icons +
+  popups** — an extension's MV3 `action` shows a toolbar icon (from `default_icon`), and clicking it
+  opens its `default_popup` page in a small floating panel hosting a real extension-origin
+  `WebContents`. (The `chrome.*` API surface and background service workers come next.)
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

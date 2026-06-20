@@ -241,6 +241,24 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   sources), `shell_content_browser_client.cc` (the binder), and rewrites
   `renderer/shell_render_frame_observer.{cc,h}`; adds the mojom + browser-impl files. Stacks on `0020`
   (reads its extension store). Default MV3 `run_at` is `document_idle`.
+- **`0023-extension-action-popup.patch`** — **extension `action` toolbar icons + popups** (E4). Each
+  enabled extension that declares an MV3 `action` now gets an icon on the right of the bookmark bar
+  (`rebuildExtensionActions`): the icon is loaded from `action.default_icon` (string or `{size: path}`
+  dict) off the extension's on-disk root, the tooltip is `action.default_title`, with a
+  `puzzlepiece.extension.fill` SF-Symbol fallback. Clicking an icon opens its `action.default_popup`
+  page (`extensionActionClicked:` → `showExtensionPopupForURL:anchor:`) in a small floating `NSPanel`
+  anchored under the button, hosting a **standalone `content::WebContents`** loaded at
+  `chrome-extension://<id>/<popup>` (the E2 scheme + factory serve it) — so the popup is a real,
+  interactive extension page at the extension's privileged origin. The popup's `WebContents` is owned
+  by the controller and torn down when the panel closes (via an `NSWindowWillCloseNotification`
+  observer, to avoid the main window's `windowShouldClose:` teardown path). The action's `action`
+  block isn't kept in the `0020` store, so it's re-read live from `manifest.json`
+  (`readManifestForExtensionId:`, `ScopedAllowBlockingForTesting`). The action bar is rebuilt on
+  startup and whenever the manager loads/enables/disables/removes an extension; `rebuildBookmarkBar`
+  preserves the action buttons. Touches `content/shell/browser/shell_platform_delegate_mac.mm` only;
+  stacks on the full `.mm` chain and on `0020`/`0021` (store + chrome-extension:// serving). A popup
+  with no `default_popup` is a no-op for now (it would fire `chrome.action.onClicked`, which needs the
+  `chrome.*` API bridge in E5).
 
 ## Workflow
 
