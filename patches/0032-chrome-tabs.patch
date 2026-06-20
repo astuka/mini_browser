@@ -1,0 +1,573 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 23b8b1e074..372705de8e 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -204,6 +204,7 @@ static_library("content_shell_lib") {
+     "browser/shell_extension_api_impl.h",
+     "browser/shell_extension_scripts_impl.cc",
+     "browser/shell_extension_scripts_impl.h",
++    "browser/shell_extension_tabs.h",
+     "browser/shell_extension_url_loader_factory.cc",
+     "browser/shell_extension_url_loader_factory.h",
+     "browser/shell_javascript_dialog.h",
+diff --git a/content/shell/browser/shell_extension_api_impl.cc b/content/shell/browser/shell_extension_api_impl.cc
+index 1be677a58a..e9f18abcc4 100644
+--- a/content/shell/browser/shell_extension_api_impl.cc
++++ b/content/shell/browser/shell_extension_api_impl.cc
+@@ -14,7 +14,9 @@
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+ #include "base/values.h"
++#include "build/build_config.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "content/shell/browser/shell_extension_tabs.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+ namespace content {
+@@ -31,6 +33,24 @@ ContextRegistry& GetContextRegistry() {
+   return *registry;
+ }
+ 
++// Serializes one tab to a chrome.tabs-style JSON object value (Wield W2).
++base::DictValue TabInfoToValue(const ShellTabInfo& tab, int index) {
++  base::DictValue dict;
++  dict.Set("id", tab.id);
++  dict.Set("url", tab.url);
++  dict.Set("title", tab.title);
++  dict.Set("active", tab.active);
++  dict.Set("windowId", 1);  // Single browser window in content_shell.
++  dict.Set("index", index);
++  return dict;
++}
++
++std::string TabInfoToJson(const ShellTabInfo& tab, int index) {
++  std::string json;
++  base::JSONWriter::Write(TabInfoToValue(tab, index), &json);
++  return json;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -144,4 +164,97 @@ void ShellExtensionApiImpl::SendMessage(const std::string& message_json) {
+   }
+ }
+ 
++void ShellExtensionApiImpl::TabsQuery(const std::string& query_json,
++                                      TabsQueryCallback callback) {
++  std::optional<base::Value> query =
++      base::JSONReader::Read(query_json, base::JSON_PARSE_RFC);
++  std::optional<bool> want_active;
++  if (query && query->is_dict()) {
++    want_active = query->GetDict().FindBool("active");
++  }
++
++  base::ListValue tabs;
++#if BUILDFLAG(IS_MAC)
++  int index = 0;
++  for (const ShellTabInfo& tab : ShellGetTabs()) {
++    if (!want_active.has_value() || *want_active == tab.active) {
++      tabs.Append(TabInfoToValue(tab, index));
++    }
++    ++index;
++  }
++#endif
++  std::string json;
++  base::JSONWriter::Write(tabs, &json);
++  std::move(callback).Run(json);
++}
++
++void ShellExtensionApiImpl::TabsGet(int32_t tab_id, TabsGetCallback callback) {
++#if BUILDFLAG(IS_MAC)
++  int index = 0;
++  for (const ShellTabInfo& tab : ShellGetTabs()) {
++    if (tab.id == tab_id) {
++      std::move(callback).Run(TabInfoToJson(tab, index));
++      return;
++    }
++    ++index;
++  }
++#endif
++  std::move(callback).Run("null");
++}
++
++void ShellExtensionApiImpl::TabsCreate(const std::string& create_json,
++                                       TabsCreateCallback callback) {
++  std::string url;
++  std::optional<base::Value> props =
++      base::JSONReader::Read(create_json, base::JSON_PARSE_RFC);
++  if (props && props->is_dict()) {
++    if (const std::string* u = props->GetDict().FindString("url")) {
++      url = *u;
++    }
++  }
++#if BUILDFLAG(IS_MAC)
++  int new_id = ShellCreateTab(url);
++  // Report the newly created tab back to the caller.
++  int index = 0;
++  for (const ShellTabInfo& tab : ShellGetTabs()) {
++    if (tab.id == new_id) {
++      std::move(callback).Run(TabInfoToJson(tab, index));
++      return;
++    }
++    ++index;
++  }
++#endif
++  std::move(callback).Run("null");
++}
++
++void ShellExtensionApiImpl::TabsUpdate(int32_t tab_id,
++                                       const std::string& update_json,
++                                       TabsUpdateCallback callback) {
++  std::string url;
++  bool make_active = false;
++  std::optional<base::Value> props =
++      base::JSONReader::Read(update_json, base::JSON_PARSE_RFC);
++  if (props && props->is_dict()) {
++    const base::DictValue& dict = props->GetDict();
++    if (const std::string* u = dict.FindString("url")) {
++      url = *u;
++    }
++    make_active = dict.FindBool("active").value_or(false);
++  }
++#if BUILDFLAG(IS_MAC)
++  if (ShellUpdateTab(tab_id, url, make_active)) {
++    // Resolve the (possibly active-tab) target to report it back.
++    int index = 0;
++    for (const ShellTabInfo& tab : ShellGetTabs()) {
++      if ((tab_id < 0 && tab.active) || tab.id == tab_id) {
++        std::move(callback).Run(TabInfoToJson(tab, index));
++        return;
++      }
++      ++index;
++    }
++  }
++#endif
++  std::move(callback).Run("null");
++}
++
+ }  // namespace content
+diff --git a/content/shell/browser/shell_extension_api_impl.h b/content/shell/browser/shell_extension_api_impl.h
+index c17bc02653..e210f5daeb 100644
+--- a/content/shell/browser/shell_extension_api_impl.h
++++ b/content/shell/browser/shell_extension_api_impl.h
+@@ -51,6 +51,14 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+       const std::string& extension_id,
+       mojo::PendingRemote<mojom::ExtensionApiClient> client) override;
+   void SendMessage(const std::string& message_json) override;
++  void TabsQuery(const std::string& query_json,
++                 TabsQueryCallback callback) override;
++  void TabsGet(int32_t tab_id, TabsGetCallback callback) override;
++  void TabsCreate(const std::string& create_json,
++                  TabsCreateCallback callback) override;
++  void TabsUpdate(int32_t tab_id,
++                  const std::string& update_json,
++                  TabsUpdateCallback callback) override;
+ 
+  private:
+   // Set once via RegisterContext; identifies which extension this context (and
+diff --git a/content/shell/browser/shell_extension_tabs.h b/content/shell/browser/shell_extension_tabs.h
+new file mode 100644
+index 0000000000..4f570d14df
+--- /dev/null
++++ b/content/shell/browser/shell_extension_tabs.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_SHELL_EXTENSION_TABS_H_
++#define CONTENT_SHELL_BROWSER_SHELL_EXTENSION_TABS_H_
++
++#include <string>
++#include <vector>
++
++namespace content {
++
++// A snapshot of one open tab, for the `chrome.tabs` API (Wield epic, W2). Built
++// from the tabbed UI's tab model (the mac TabbedShellController) so the
++// browser-side ExtensionApi can answer tabs.query/get and report created/updated
++// tabs without depending on platform UI types.
++struct ShellTabInfo {
++  int id = 0;
++  std::string url;
++  std::string title;
++  bool active = false;
++};
++
++// Returns all open tabs in display order (folders flattened). Implemented in the
++// platform delegate; returns empty if there's no tab controller.
++std::vector<ShellTabInfo> ShellGetTabs();
++
++// Opens a new tab loading `url` (blank if empty) and returns its tab id, or -1
++// on failure.
++int ShellCreateTab(const std::string& url);
++
++// Navigates tab `tab_id` to `url` (if non-empty) and/or activates it. Returns
++// false if no such tab. `tab_id` < 0 targets the active tab.
++bool ShellUpdateTab(int tab_id, const std::string& url, bool make_active);
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_SHELL_EXTENSION_TABS_H_
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 9230e4dc09..6008a351e1 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -54,6 +54,7 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
++#include "content/shell/browser/shell_extension_tabs.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
+ #include "components/crx_file/crx_verifier.h"
+ #include "crypto/sha2.h"
+@@ -161,6 +162,7 @@ @interface TabNode : NSObject {
+  @public
+   TabNodeKind kind;               // Tab vs. folder.
+   // Tab payload (kind == TabNodeKindTab):
++  int tabId;                      // Stable id for chrome.tabs (0 for folders).
+   raw_ptr<content::Shell> shell;  // Not owned; the Shell is self-owning.
+   __weak NSView* webView;         // Owned by the WebContents / view hierarchy.
+   // Folder payload (kind == TabNodeKindFolder):
+@@ -259,6 +261,12 @@ - (void)attachContentsForShell:(content::Shell*)shell;
+ - (void)removeTabForShell:(content::Shell*)shell;
+ - (TabNode*)tabForShell:(content::Shell*)shell;
+ - (content::Shell*)activeShell;
++// chrome.tabs bridge (Wield W2).
++- (std::vector<content::ShellTabInfo>)extensionTabs;
++- (int)extensionCreateTabWithURL:(const std::string&)url;
++- (BOOL)extensionUpdateTab:(int)tabId
++                       url:(const std::string&)url
++                makeActive:(BOOL)makeActive;
+ - (void)setURLString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setEnabled:(BOOL)enabled
+@@ -320,6 +328,9 @@ - (BOOL)performBookmarkBarDrop;
+ // The single shared controller for the whole process. Strong under ARC.
+ TabbedShellController* g_tab_controller = nil;
+ 
++// Monotonic source of chrome.tabs ids (assigned per tab in addTabForShell).
++int g_next_tab_id = 1;
++
+ // Extracts a 32-char [a-p] extension id from either a bare id or a Chrome Web
+ // Store URL (".../detail/<slug>/<id>"). Returns "" if no valid id is found.
+ std::string ExtractWebStoreId(std::string input) {
+@@ -851,9 +862,80 @@ - (NSUInteger)countTabsIn:(NSArray<TabNode*>*)nodes {
+   return _activeTab ? _activeTab->shell : nullptr;
+ }
+ 
++// Recursively appends tab-kind nodes (in display order) to `out` as ShellTabInfo.
++- (void)collectExtensionTabs:(NSArray<TabNode*>*)nodes
++                        into:(std::vector<content::ShellTabInfo>*)out {
++  for (TabNode* node in nodes) {
++    if (node->kind == TabNodeKindFolder) {
++      [self collectExtensionTabs:node->children into:out];
++      continue;
++    }
++    if (!node->shell) {
++      continue;
++    }
++    content::ShellTabInfo info;
++    info.id = node->tabId;
++    info.url = node->shell->web_contents()->GetLastCommittedURL().spec();
++    info.title = base::UTF16ToUTF8(node->shell->web_contents()->GetTitle());
++    info.active = (node == _activeTab);
++    out->push_back(std::move(info));
++  }
++}
++
++- (std::vector<content::ShellTabInfo>)extensionTabs {
++  std::vector<content::ShellTabInfo> tabs;
++  [self collectExtensionTabs:_tabs into:&tabs];
++  return tabs;
++}
++
++- (TabNode*)tabNodeForId:(int)tabId in:(NSArray<TabNode*>*)nodes {
++  for (TabNode* node in nodes) {
++    if (node->kind == TabNodeKindFolder) {
++      TabNode* found = [self tabNodeForId:tabId in:node->children];
++      if (found) {
++        return found;
++      }
++    } else if (node->tabId == tabId) {
++      return node;
++    }
++  }
++  return nil;
++}
++
++- (int)extensionCreateTabWithURL:(const std::string&)url {
++  content::Shell* active = [self activeShell];
++  if (!active) {
++    return -1;
++  }
++  GURL gurl(url.empty() ? "about:blank" : url);
++  _foregroundNextTab = YES;
++  content::Shell* shell = content::Shell::CreateNewWindow(
++      active->web_contents()->GetBrowserContext(), gurl, nullptr,
++      content::Shell::GetShellDefaultSize());
++  TabNode* node = shell ? [self tabForShell:shell] : nil;
++  return node ? node->tabId : -1;
++}
++
++- (BOOL)extensionUpdateTab:(int)tabId
++                       url:(const std::string&)url
++                makeActive:(BOOL)makeActive {
++  TabNode* node = tabId < 0 ? _activeTab : [self tabNodeForId:tabId in:_tabs];
++  if (!node || node->kind != TabNodeKindTab || !node->shell) {
++    return NO;
++  }
++  if (!url.empty()) {
++    node->shell->LoadURL(GURL(url));
++  }
++  if (makeActive) {
++    [self activateTab:node];
++  }
++  return YES;
++}
++
+ - (void)addTabForShell:(content::Shell*)shell {
+   TabNode* tab = [[TabNode alloc] init];
+   tab->shell = shell;
++  tab->tabId = g_next_tab_id++;
+ 
+   TabRowView* row = [[TabRowView alloc] initWithFrame:NSZeroRect];
+   row.wantsLayer = YES;
+@@ -3359,6 +3441,31 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+ 
+ namespace content {
+ 
++// chrome.tabs bridge (Wield W2): thin C++ wrappers over the tab controller so
++// the browser-side ExtensionApi can answer tabs.query/get/create/update.
++std::vector<ShellTabInfo> ShellGetTabs() {
++  if (!g_tab_controller) {
++    return {};
++  }
++  return [g_tab_controller extensionTabs];
++}
++
++int ShellCreateTab(const std::string& url) {
++  if (!g_tab_controller) {
++    return -1;
++  }
++  return [g_tab_controller extensionCreateTabWithURL:url];
++}
++
++bool ShellUpdateTab(int tab_id, const std::string& url, bool make_active) {
++  if (!g_tab_controller) {
++    return false;
++  }
++  return [g_tab_controller extensionUpdateTab:tab_id
++                                          url:url
++                                   makeActive:make_active];
++}
++
+ // These are required by the header (it declares the members), but the tab
+ // controller above holds all real state, so they stay empty.
+ struct ShellPlatformDelegate::ShellData {};
+diff --git a/content/shell/common/shell_extension_api.mojom b/content/shell/common/shell_extension_api.mojom
+index 0297dd3dbf..fb439b5ba3 100644
+--- a/content/shell/common/shell_extension_api.mojom
++++ b/content/shell/common/shell_extension_api.mojom
+@@ -49,4 +49,21 @@ interface ExtensionApi {
+   // context of this context's extension, as chrome.runtime.onMessage. The
+   // browser supplies the sender info, so a context can't spoof another id.
+   SendMessage(string message_json);
++
++  // chrome.tabs core subset (Wield W2), backed by the tabbed UI's tab model.
++  // Tab objects are returned as JSON ({id,url,title,active,windowId,index}).
++
++  // Returns matching tabs as a JSON array. `query_json` is the JSON query
++  // (e.g. {"active":true,"currentWindow":true}); empty/{} returns all tabs.
++  TabsQuery(string query_json) => (string tabs_json);
++
++  // Returns the tab with `tab_id` as a JSON object, or "null" if none.
++  TabsGet(int32 tab_id) => (string tab_json);
++
++  // Opens a new tab from `create_json` ({"url":...}) and returns it as JSON.
++  TabsCreate(string create_json) => (string tab_json);
++
++  // Updates tab `tab_id` from `update_json` ({"url":...,"active":...}); a
++  // negative `tab_id` targets the active tab. Returns the tab as JSON, or "null".
++  TabsUpdate(int32 tab_id, string update_json) => (string tab_json);
+ };
+diff --git a/content/shell/renderer/shell_extension_context_bindings.cc b/content/shell/renderer/shell_extension_context_bindings.cc
+index bf971fcb7b..f5e6e8d1c2 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.cc
++++ b/content/shell/renderer/shell_extension_context_bindings.cc
+@@ -150,6 +150,54 @@ std::string BuildChromeShim(const std::string& extension_id) {
+     }
+   };
+ 
++  // chrome.tabs core subset (Wield W2), backed by the native bridge. The browser
++  // returns tab objects as JSON; we parse and apply the chrome.tabs callback/
++  // promise conventions here.
++  function parseTab(jsonStr) {
++    try { return JSON.parse(jsonStr); } catch (e) { return null; }
++  }
++  chrome.tabs = {
++    query: function(queryInfo, cb) {
++      var p = __api.tabsQuery(JSON.stringify(queryInfo || {})).then(function(j) {
++        var arr; try { arr = JSON.parse(j) || []; } catch (e) { arr = []; }
++        if (typeof cb === "function") cb(arr);
++        return arr;
++      });
++      return p;
++    },
++    get: function(tabId, cb) {
++      var p = __api.tabsGet(tabId | 0).then(function(j) {
++        var tab = parseTab(j);
++        if (typeof cb === "function") cb(tab);
++        return tab;
++      });
++      return p;
++    },
++    create: function(createProperties, cb) {
++      var p = __api.tabsCreate(JSON.stringify(createProperties || {}))
++                  .then(function(j) {
++        var tab = parseTab(j);
++        if (typeof cb === "function") cb(tab);
++        return tab;
++      });
++      return p;
++    },
++    update: function(tabId, updateProperties, cb) {
++      // Overloads: update(updateProperties[, cb]) targets the active tab;
++      // update(tabId, updateProperties[, cb]) targets a specific tab.
++      if (typeof tabId === "object" && tabId !== null) {
++        cb = updateProperties; updateProperties = tabId; tabId = -1;
++      }
++      var p = __api.tabsUpdate(tabId | 0, JSON.stringify(updateProperties || {}))
++                  .then(function(j) {
++        var tab = parseTab(j);
++        if (typeof cb === "function") cb(tab);
++        return tab;
++      });
++      return p;
++    }
++  };
++
+   // Minimal chrome.action stubs (full support arrives later in the epic).
+   chrome.action = chrome.action || {
+     setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
+@@ -262,6 +310,10 @@ void ShellExtensionContextBindings::Install() {
+   install_fn("storageRemove", &ShellExtensionContextBindings::StorageRemove);
+   install_fn("storageClear", &ShellExtensionContextBindings::StorageClear);
+   install_fn("sendMessage", &ShellExtensionContextBindings::SendMessage);
++  install_fn("tabsQuery", &ShellExtensionContextBindings::TabsQuery);
++  install_fn("tabsGet", &ShellExtensionContextBindings::TabsGet);
++  install_fn("tabsCreate", &ShellExtensionContextBindings::TabsCreate);
++  install_fn("tabsUpdate", &ShellExtensionContextBindings::TabsUpdate);
+ 
+   // setMessageDispatcher returns void, so bind it directly.
+   {
+@@ -442,4 +494,90 @@ v8::Local<v8::Value> ShellExtensionContextBindings::StorageClear(
+   return promise;
+ }
+ 
++v8::Local<v8::Value> ShellExtensionContextBindings::TabsQuery(
++    gin::Arguments* args) {
++  std::string query_json;
++  args->GetNext(&query_json);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->TabsQuery(
++      query_json,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::TabsGet(
++    gin::Arguments* args) {
++  int32_t tab_id = 0;
++  args->GetNext(&tab_id);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->TabsGet(
++      tab_id,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::TabsCreate(
++    gin::Arguments* args) {
++  std::string create_json;
++  args->GetNext(&create_json);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->TabsCreate(
++      create_json,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::TabsUpdate(
++    gin::Arguments* args) {
++  int32_t tab_id = -1;
++  std::string update_json;
++  args->GetNext(&tab_id);
++  args->GetNext(&update_json);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->TabsUpdate(
++      tab_id, update_json,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_extension_context_bindings.h b/content/shell/renderer/shell_extension_context_bindings.h
+index 948ffac7bb..b38532ff33 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.h
++++ b/content/shell/renderer/shell_extension_context_bindings.h
+@@ -64,6 +64,13 @@ class ShellExtensionContextBindings : public mojom::ExtensionApiClient {
+   v8::Local<v8::Value> SendMessage(gin::Arguments* args);
+   void SetMessageDispatcher(gin::Arguments* args);
+ 
++  // chrome.tabs (Wield W2). Each returns a JS Promise resolving with the tab(s)
++  // as JSON (an array for query, a single object otherwise).
++  v8::Local<v8::Value> TabsQuery(gin::Arguments* args);
++  v8::Local<v8::Value> TabsGet(gin::Arguments* args);
++  v8::Local<v8::Value> TabsCreate(gin::Arguments* args);
++  v8::Local<v8::Value> TabsUpdate(gin::Arguments* args);
++
+   // Lazily binds the ExtensionApi pipe to the browser.
+   void EnsureApi();
+ 
