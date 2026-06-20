@@ -1,0 +1,229 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index b0ff56abe5..569b09927f 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -336,6 +336,7 @@ static_library("content_shell_lib") {
+     "//base",
+     "//base:base_static",
+     "//components/cdm/renderer",
++    "//components/crx_file",
+     "//components/custom_handlers",
+     "//components/custom_handlers:test_support",
+     "//components/embedder_support",
+@@ -377,6 +378,7 @@ static_library("content_shell_lib") {
+     "//third_party/blink/public:resources",
+     "//third_party/blink/public/strings",
+     "//third_party/inspector_protocol:crdtp",
++    "//third_party/zlib/google:zip",
+     "//ui/base",
+     "//ui/base/clipboard",
+     "//ui/base/ime/init",
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index a9b01ee6af..1ac9eedcb3 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -50,7 +50,9 @@
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "components/crx_file/crx_verifier.h"
+ #include "crypto/sha2.h"
++#include "third_party/zlib/google/zip.h"
+ #include "base/time/time.h"
+ #include "net/cert/cert_status_flags.h"
+ #include "net/cert/x509_cert_types.h"
+@@ -281,6 +283,10 @@ - (NSString*)pathForExtensionId:(NSString*)extId;
+ - (NSImage*)iconForAction:(const base::DictValue*)action
+               extensionId:(NSString*)extId;
+ - (void)extensionActionClicked:(NSButton*)sender;
++- (BOOL)registerExtensionAtPath:(NSString*)dir withId:(NSString*)extId;
++- (void)refreshExtensionSurfaces;
++- (void)loadPackagedExtension:(id)sender;
++- (void)installCrxFromPath:(NSString*)crxPath;
+ - (void)showExtensionPopupForURL:(const GURL&)url anchor:(NSView*)anchor;
+ - (void)onExtensionPopupClosed;
+ - (void)closeExtensionPopup;
+@@ -1727,25 +1733,23 @@ - (void)showExtensionError:(NSString*)message {
+ // Read and parse <dir>/manifest.json, validate the MV3 essentials, and register
+ // the extension in our persisted store. No execution happens in E1 — this only
+ // records what the extension *is*.
+-- (void)installExtensionFromDirectory:(NSString*)dir {
+-  // Reading the manifest is a small, synchronous, user-initiated file read on
+-  // the UI thread (the user just picked the folder in an open panel), so allow
+-  // blocking here. content_shell is a test shell; a future PR that serves
+-  // chrome-extension:// resources will move file I/O off-thread properly.
++// Reads <dir>/manifest.json, validates the MV3 essentials, and registers the
++// extension under `extId` in the persisted store. Returns NO (after showing an
++// error) if the manifest is missing/invalid. The caller refreshes the UI.
++- (BOOL)registerExtensionAtPath:(NSString*)dir withId:(NSString*)extId {
+   base::ScopedAllowBlockingForTesting allow_blocking;
+-  NSString* manifestPath =
+-      [dir stringByAppendingPathComponent:@"manifest.json"];
+   std::string contents;
+-  base::FilePath fp(base::SysNSStringToUTF8(manifestPath));
++  base::FilePath fp(base::SysNSStringToUTF8(
++      [dir stringByAppendingPathComponent:@"manifest.json"]));
+   if (!base::ReadFileToString(fp, &contents)) {
+-    [self showExtensionError:@"That folder has no readable manifest.json."];
+-    return;
++    [self showExtensionError:@"That extension has no readable manifest.json."];
++    return NO;
+   }
+   std::optional<base::Value> parsed = base::JSONReader::Read(
+       contents, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
+   if (!parsed || !parsed->is_dict()) {
+     [self showExtensionError:@"manifest.json is not valid JSON."];
+-    return;
++    return NO;
+   }
+   const base::DictValue& manifest = parsed->GetDict();
+   const std::string* name = manifest.FindString("name");
+@@ -1753,7 +1757,7 @@ - (void)installExtensionFromDirectory:(NSString*)dir {
+   if (!name || !version) {
+     [self showExtensionError:
+               @"manifest.json is missing a \"name\" or \"version\"."];
+-    return;
++    return NO;
+   }
+ 
+   base::DictValue entry;
+@@ -1770,18 +1774,122 @@ - (void)installExtensionFromDirectory:(NSString*)dir {
+   if (const base::ListValue* hosts = manifest.FindList("host_permissions"))
+     entry.Set("host_permissions", hosts->Clone());
+ 
+-  NSString* extId = [self extensionIdForPath:dir];
+   content::ShellContentBrowserClient* client =
+       content::ShellContentBrowserClient::Get();
+   base::DictValue extensions = client->GetExtensions();
+   extensions.Set(base::SysNSStringToUTF8(extId), std::move(entry));
+   client->SetExtensions(std::move(extensions));
++  return YES;
++}
++
++// Refreshes every surface that depends on the installed/enabled set.
++- (void)refreshExtensionSurfaces {
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
+   [self rebuildBackgroundPages];
+   content::ShellContentBrowserClient::Get()->ReloadExtensionNetRules();
+ }
+ 
++- (void)installExtensionFromDirectory:(NSString*)dir {
++  // Unpacked extensions get a path-derived id (Chrome's scheme for unpacked).
++  if ([self registerExtensionAtPath:dir withId:[self extensionIdForPath:dir]])
++    [self refreshExtensionSurfaces];
++}
++
++// Installs a packaged .crx (E8): verifies the CRX3 signature, unpacks the ZIP to
++// a managed dir under the profile, and registers it under its signature-derived
++// id. Rejects tampered/invalid packages.
++- (void)installCrxFromPath:(NSString*)crxPath {
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  base::FilePath crx(base::SysNSStringToUTF8(crxPath));
++
++  std::string public_key;
++  std::string crx_id;
++  crx_file::VerifierResult result =
++      crx_file::Verify(crx, crx_file::VerifierFormat::CRX3,
++                       /*required_key_hashes=*/{}, /*required_file_hash=*/{},
++                       &public_key, &crx_id, /*compressed_verified_contents=*/
++                       nullptr);
++  if (result != crx_file::VerifierResult::OK_FULL) {
++    [self showExtensionError:
++              [NSString stringWithFormat:
++                            @"CRX signature verification failed (code %d). The "
++                            @"package may be corrupt or tampered with.",
++                            static_cast<int>(result)]];
++    return;
++  }
++
++  // Find where the ZIP archive starts: 12-byte prefix (magic + version +
++  // header_size) followed by the CrxFileHeader, then the ZIP.
++  std::string crx_bytes;
++  if (!base::ReadFileToString(crx, &crx_bytes) || crx_bytes.size() < 12) {
++    [self showExtensionError:@"Couldn't read the CRX file."];
++    return;
++  }
++  uint32_t header_size =
++      static_cast<uint8_t>(crx_bytes[8]) |
++      (static_cast<uint8_t>(crx_bytes[9]) << 8) |
++      (static_cast<uint8_t>(crx_bytes[10]) << 16) |
++      (static_cast<uint32_t>(static_cast<uint8_t>(crx_bytes[11])) << 24);
++  size_t zip_offset = 12u + header_size;
++  if (zip_offset >= crx_bytes.size()) {
++    [self showExtensionError:@"CRX contains no archive."];
++    return;
++  }
++
++  content::Shell* active = [self activeShell];
++  content::BrowserContext* browser_context =
++      active ? active->web_contents()->GetBrowserContext() : nullptr;
++  if (!browser_context)
++    return;
++  base::FilePath dest =
++      browser_context->GetPath().Append("CRXExtensions").Append(crx_id);
++  base::DeletePathRecursively(dest);  // Reinstall cleanly.
++  if (!base::CreateDirectory(dest)) {
++    [self showExtensionError:@"Couldn't create the install directory."];
++    return;
++  }
++
++  // Write the ZIP portion to a temp file and unpack it.
++  base::FilePath temp_zip = dest.DirName().Append(crx_id + ".zip");
++  if (!base::WriteFile(temp_zip,
++                       std::string_view(crx_bytes).substr(zip_offset))) {
++    [self showExtensionError:@"Couldn't stage the CRX archive."];
++    return;
++  }
++  bool unzipped = zip::Unzip(temp_zip, dest);
++  base::DeleteFile(temp_zip);
++  if (!unzipped) {
++    [self showExtensionError:@"Couldn't unpack the CRX archive."];
++    return;
++  }
++
++  if ([self registerExtensionAtPath:base::SysUTF8ToNSString(dest.value())
++                            withId:base::SysUTF8ToNSString(crx_id)]) {
++    [self refreshExtensionSurfaces];
++  }
++}
++
++- (void)loadPackagedExtension:(id)sender {
++  NSOpenPanel* panel = [NSOpenPanel openPanel];
++  panel.canChooseFiles = YES;
++  panel.canChooseDirectories = NO;
++  panel.allowsMultipleSelection = NO;
++  panel.prompt = @"Install";
++  panel.message = @"Choose a packaged extension (.crx)";
++  NSWindow* host = _extensionsPanel ?: _window;
++  __weak TabbedShellController* weakSelf = self;
++  void (^handler)(NSModalResponse) = ^(NSModalResponse modalResult) {
++    if (modalResult != NSModalResponseOK || panel.URLs.count == 0)
++      return;
++    [weakSelf installCrxFromPath:panel.URLs.firstObject.path];
++  };
++  if (host)
++    [panel beginSheetModalForWindow:host completionHandler:handler];
++  else
++    handler([panel runModal]);
++}
++
+ - (void)loadUnpackedExtension:(id)sender {
+   NSOpenPanel* panel = [NSOpenPanel openPanel];
+   panel.canChooseFiles = NO;
+@@ -1977,6 +2085,15 @@ - (void)showExtensionsManager {
+     loadBtn.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+     [contentView addSubview:loadBtn];
+ 
++    NSButton* loadCrxBtn =
++        [NSButton buttonWithTitle:@"Load Packaged (.crx)…"
++                           target:self
++                           action:@selector(loadPackagedExtension:)];
++    loadCrxBtn.frame = NSMakeRect(168, 12, 180, 30);
++    loadCrxBtn.bezelStyle = NSBezelStyleRounded;
++    loadCrxBtn.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
++    [contentView addSubview:loadCrxBtn];
++
+     NSScrollView* scroll = [[NSScrollView alloc]
+         initWithFrame:NSMakeRect(0, 54, frame.size.width,
+                                  frame.size.height - 54)];
