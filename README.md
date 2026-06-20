@@ -97,8 +97,10 @@ Run it:
   messaging) and `chrome.storage.local` (persisted per-extension); and a **persistent background
   page** — an extension's MV3 `background.service_worker` runs in a hidden extension-origin
   `WebContents` (a reduced background model), able to react to messages and share `chrome.storage`
-  with the popup. (A true ephemeral service worker, network blocking / `declarativeNetRequest`, and
-  CRX / Web Store install come next.)
+  with the popup; and **`declarativeNetRequest` block rules** — an ad/content blocker: enabled
+  extensions' static DNR rules block matching network requests (subresources included) via a proxying
+  `URLLoaderFactory`, toggled live as extensions are enabled/disabled. (A true ephemeral service
+  worker, and CRX / Web Store install, come next.)
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
