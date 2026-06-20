@@ -93,7 +93,9 @@ Run it:
   against the manifest patterns and injects at the right `run_at`); and **extension action icons +
   popups** — an extension's MV3 `action` shows a toolbar icon (from `default_icon`), and clicking it
   opens its `default_popup` page in a small floating panel hosting a real extension-origin
-  `WebContents`. (The `chrome.*` API surface and background service workers come next.)
+  `WebContents`; and a **`chrome.*` API shim** in extension pages — `chrome.runtime` (`id`, `getURL`,
+  messaging) and `chrome.storage.local` (persisted per-extension). (Background service workers and
+  giving content scripts the same APIs come next.)
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
