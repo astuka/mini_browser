@@ -273,6 +273,23 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `0021` (extension store + `chrome-extension://` origin). Scope note: this covers **extension pages**;
   giving content scripts (which run in an isolated world at the *page's* origin) the same APIs needs a
   browser-backed transport, which arrives with a later PR (alongside the background worker).
+- **`0025-background-service-worker.patch`** — a **persistent background page** for MV3 extensions
+  (E6), our reduced "background service worker" model. content_shell has no extension service-worker
+  registration machinery, so instead of a true SW we host each enabled extension's
+  `background.service_worker` script as a long-lived **hidden `WebContents`** at the extension origin
+  (so it gets the `0024` `chrome.*` shim). The `0021` factory gains a synthetic resource at
+  `chrome-extension://<id>/__shell_background.html` (`BuildBackgroundPage`) — generated HTML that
+  `<script>`-loads the manifest's `background.service_worker` (honoring `background.type: "module"`).
+  The controller (`rebuildBackgroundPages`) diffs enabled-with-background extensions against the live
+  `_backgroundPages` map, creating a hidden `WebContents` (`WebContents::Create` + `LoadURL`) for new
+  ones and destroying those no longer wanted; it runs once a browser context exists (first tab attach)
+  and after every manager load/enable/disable/remove, and is cleared on window close. Because the
+  background page and the popup share the extension origin, they message each other and share
+  `chrome.storage` via the `0024` shim with no extra plumbing. Touches
+  `shell_extension_url_loader_factory.cc` (the synthetic page) and `shell_platform_delegate_mac.mm`
+  (hosting); stacks on `0020`/`0021`/`0024`. Reduced-model caveats: it's a persistent page, not a real
+  ephemeral SW (no `onInstalled`/SW-only events; runs while the browser is open), and cross-context
+  messaging is same-origin-only (extension pages, not content scripts).
 
 ## Workflow
 
