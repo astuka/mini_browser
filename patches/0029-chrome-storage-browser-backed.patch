@@ -1,0 +1,752 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 569b09927f..3530c7eaed 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -200,6 +200,8 @@ static_library("content_shell_lib") {
+     "browser/shell_devtools_manager_delegate.h",
+     "browser/shell_download_manager_delegate.cc",
+     "browser/shell_download_manager_delegate.h",
++    "browser/shell_extension_api_impl.cc",
++    "browser/shell_extension_api_impl.h",
+     "browser/shell_extension_scripts_impl.cc",
+     "browser/shell_extension_scripts_impl.h",
+     "browser/shell_extension_url_loader_factory.cc",
+@@ -364,6 +366,7 @@ static_library("content_shell_lib") {
+     "//content/test:test_support",
+     "//crypto",
+     "//device/bluetooth",
++    "//gin",
+     "//media",
+     "//media/mojo:buildflags",
+     "//media/mojo/services",
+@@ -1099,6 +1102,7 @@ mojom("content_browsertests_mojom") {
+     "common/memory_coordinator/memory_coordinator_test.mojom",
+     "common/power_monitor_test.mojom",
+     "common/render_frame_test_helper.mojom",
++    "common/shell_extension_api.mojom",
+     "common/shell_extension_scripts.mojom",
+   ]
+   public_deps = [
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index dcad4f98b8..d013b8a311 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -90,6 +90,7 @@
+ #include "content/shell/browser/shell_platform_delegate.h"
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
++#include "content/shell/browser/shell_extension_api_impl.h"
+ #include "content/shell/browser/shell_extension_scripts_impl.h"
+ #include "content/shell/browser/shell_extension_url_loader_factory.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+@@ -190,6 +191,12 @@ inline constexpr char kSiteSettings[] = "content_shell.site_settings";
+ // built directly on content_shell rather than //chrome/browser/extensions.
+ inline constexpr char kExtensions[] = "content_shell.extensions";
+ 
++// Per-extension `chrome.storage.local` data (Wield epic, W1a). A JSON dict
++// keyed by extension id; each value is that extension's own key→value store,
++// shared across all of its contexts and persisted in local state. This is the
++// browser-backed replacement for E5's per-origin localStorage shim.
++inline constexpr char kExtensionStorage[] = "content_shell.extension_storage";
++
+ using PerformanceManagerRegistry =
+     performance_manager::PerformanceManagerRegistry;
+ 
+@@ -332,6 +339,7 @@ std::unique_ptr<PrefService> CreateLocalState() {
+   pref_registry->RegisterDictionaryPref(kSession);
+   pref_registry->RegisterDictionaryPref(kSiteSettings);
+   pref_registry->RegisterDictionaryPref(kExtensions);
++  pref_registry->RegisterDictionaryPref(kExtensionStorage);
+ 
+ #if BUILDFLAG(IS_IOS)
+   pref_registry->RegisterBooleanPref(kJITEnabled, true);
+@@ -672,6 +680,24 @@ void ShellContentBrowserClient::SetExtensions(base::DictValue extensions) {
+   GetSharedState().local_state->CommitPendingWrite();
+ }
+ 
++base::DictValue ShellContentBrowserClient::GetExtensionStorageDict(
++    const std::string& extension_id) {
++  const base::DictValue& all =
++      GetSharedState().local_state->GetDict(kExtensionStorage);
++  const base::DictValue* entry = all.FindDict(extension_id);
++  return entry ? entry->Clone() : base::DictValue();
++}
++
++void ShellContentBrowserClient::SetExtensionStorageDict(
++    const std::string& extension_id,
++    base::DictValue data) {
++  base::DictValue all =
++      GetSharedState().local_state->GetDict(kExtensionStorage).Clone();
++  all.Set(extension_id, std::move(data));
++  GetSharedState().local_state->SetDict(kExtensionStorage, std::move(all));
++  GetSharedState().local_state->CommitPendingWrite();
++}
++
+ void ShellContentBrowserClient::ReloadExtensionNetRules() {
+   // Recompiles the declarativeNetRequest block filters from enabled extensions'
+   // static rule resources. UI thread; small, infrequent (startup + on extension
+@@ -943,6 +969,9 @@ void ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
+   // Lets the renderer fetch installed extensions' content scripts (Graft epic).
+   map->Add<mojom::ShellExtensionScripts>(
+       base::BindRepeating(&ShellExtensionScriptsImpl::Create));
++  // Browser-backed chrome.* transport: chrome.storage.local for now (Wield W1a).
++  map->Add<mojom::ExtensionApi>(
++      base::BindRepeating(&ShellExtensionApiImpl::Create));
+ #if BUILDFLAG(IS_WIN)
+   map->Add<media::mojom::MediaFoundationPreferences>(
+       &BindMediaFoundationPreferences);
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index e9cc83d6a6..d2a51b7a37 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -274,6 +274,14 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   base::DictValue GetExtensions();
+   void SetExtensions(base::DictValue extensions);
+ 
++  // Per-extension `chrome.storage.local` store (Wield epic, W1a). Returns a copy
++  // of the extension's key→value blob (empty if none); SetExtensionStorageDict
++  // replaces it and flushes to disk. Shared across all of an extension's
++  // contexts via the browser-backed ExtensionApi transport.
++  base::DictValue GetExtensionStorageDict(const std::string& extension_id);
++  void SetExtensionStorageDict(const std::string& extension_id,
++                               base::DictValue data);
++
+   // Recompiles enabled extensions' declarativeNetRequest block rules into the
+   // filter list consulted by the request-blocking throttle. Call on the UI
+   // thread at startup and whenever the installed/enabled set changes.
+diff --git a/content/shell/browser/shell_extension_api_impl.cc b/content/shell/browser/shell_extension_api_impl.cc
+new file mode 100644
+index 0000000000..9e9e042c5b
+--- /dev/null
++++ b/content/shell/browser/shell_extension_api_impl.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/browser/shell_extension_api_impl.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/values.h"
++#include "content/shell/browser/shell_content_browser_client.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace content {
++
++// static
++void ShellExtensionApiImpl::Create(
++    RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<mojom::ExtensionApi> receiver) {
++  mojo::MakeSelfOwnedReceiver(std::make_unique<ShellExtensionApiImpl>(),
++                              std::move(receiver));
++}
++
++ShellExtensionApiImpl::ShellExtensionApiImpl() = default;
++ShellExtensionApiImpl::~ShellExtensionApiImpl() = default;
++
++void ShellExtensionApiImpl::StorageGet(const std::string& extension_id,
++                                       StorageGetCallback callback) {
++  base::DictValue data =
++      ShellContentBrowserClient::Get()->GetExtensionStorageDict(extension_id);
++  std::string json;
++  base::JSONWriter::Write(data, &json);
++  std::move(callback).Run(json);
++}
++
++void ShellExtensionApiImpl::StorageSet(const std::string& extension_id,
++                                       const std::string& items_json,
++                                       StorageSetCallback callback) {
++  base::DictValue data =
++      ShellContentBrowserClient::Get()->GetExtensionStorageDict(extension_id);
++  std::optional<base::Value> items =
++      base::JSONReader::Read(items_json, base::JSON_PARSE_RFC);
++  if (items && items->is_dict()) {
++    for (auto&& [key, value] : items->GetDict()) {
++      data.Set(key, value.Clone());
++    }
++  }
++  ShellContentBrowserClient::Get()->SetExtensionStorageDict(extension_id,
++                                                            std::move(data));
++  std::move(callback).Run();
++}
++
++void ShellExtensionApiImpl::StorageRemove(const std::string& extension_id,
++                                          const std::string& keys_json,
++                                          StorageRemoveCallback callback) {
++  base::DictValue data =
++      ShellContentBrowserClient::Get()->GetExtensionStorageDict(extension_id);
++  std::optional<base::Value> keys =
++      base::JSONReader::Read(keys_json, base::JSON_PARSE_RFC);
++  if (keys && keys->is_list()) {
++    for (const base::Value& key : keys->GetList()) {
++      if (key.is_string()) {
++        data.Remove(key.GetString());
++      }
++    }
++  }
++  ShellContentBrowserClient::Get()->SetExtensionStorageDict(extension_id,
++                                                            std::move(data));
++  std::move(callback).Run();
++}
++
++void ShellExtensionApiImpl::StorageClear(const std::string& extension_id,
++                                         StorageClearCallback callback) {
++  ShellContentBrowserClient::Get()->SetExtensionStorageDict(extension_id,
++                                                            base::DictValue());
++  std::move(callback).Run();
++}
++
++}  // namespace content
+diff --git a/content/shell/browser/shell_extension_api_impl.h b/content/shell/browser/shell_extension_api_impl.h
+new file mode 100644
+index 0000000000..e498c41536
+--- /dev/null
++++ b/content/shell/browser/shell_extension_api_impl.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_SHELL_EXTENSION_API_IMPL_H_
++#define CONTENT_SHELL_BROWSER_SHELL_EXTENSION_API_IMPL_H_
++
++#include <string>
++
++#include "content/shell/common/shell_extension_api.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace content {
++
++class RenderFrameHost;
++
++// Browser-side implementation of the `chrome.*` transport (Wield epic, W1a).
++// Bound once per RenderFrame; for now it backs `chrome.storage.local` with a
++// per-extension JSON store persisted in local state, shared across every
++// context of an extension. Built on content_shell, not //chrome/browser/extensions.
++class ShellExtensionApiImpl : public mojom::ExtensionApi {
++ public:
++  // Binder for ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame.
++  static void Create(RenderFrameHost* render_frame_host,
++                     mojo::PendingReceiver<mojom::ExtensionApi> receiver);
++
++  ShellExtensionApiImpl();
++  ~ShellExtensionApiImpl() override;
++
++  ShellExtensionApiImpl(const ShellExtensionApiImpl&) = delete;
++  ShellExtensionApiImpl& operator=(const ShellExtensionApiImpl&) = delete;
++
++  // mojom::ExtensionApi:
++  void StorageGet(const std::string& extension_id,
++                  StorageGetCallback callback) override;
++  void StorageSet(const std::string& extension_id,
++                  const std::string& items_json,
++                  StorageSetCallback callback) override;
++  void StorageRemove(const std::string& extension_id,
++                     const std::string& keys_json,
++                     StorageRemoveCallback callback) override;
++  void StorageClear(const std::string& extension_id,
++                    StorageClearCallback callback) override;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_SHELL_EXTENSION_API_IMPL_H_
+diff --git a/content/shell/common/shell_extension_api.mojom b/content/shell/common/shell_extension_api.mojom
+new file mode 100644
+index 0000000000..39e2f8b16e
+--- /dev/null
++++ b/content/shell/common/shell_extension_api.mojom
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module content.mojom;
++
++// Browser-implemented, bound per RenderFrame. The browser-backed transport for
++// our from-scratch `chrome.*` runtime (Wield epic, W1) — it replaces E5's
++// pure-JS localStorage shim so an extension's data lives in one
++// browser-persisted store shared across all of the extension's contexts
++// (popup, options, background, and — once W1b lands — content scripts).
++//
++// `extension_id` identifies which extension's store to touch. Storage payloads
++// are passed as JSON text so arbitrary extension values cross the boundary
++// without a structured-value dependency; the renderer keeps the chrome.storage
++// key/default semantics and the browser is just a persistent key→value blob
++// store per extension.
++interface ExtensionApi {
++  // Returns the extension's entire storage blob as a JSON object string ("{}"
++  // when empty). The renderer applies get(keys)/defaults locally.
++  StorageGet(string extension_id) => (string json);
++
++  // Merges the keys in `items_json` (a JSON object) into the store.
++  StorageSet(string extension_id, string items_json) => ();
++
++  // Removes each key named in `keys_json` (a JSON array of strings).
++  StorageRemove(string extension_id, string keys_json) => ();
++
++  // Empties the extension's store.
++  StorageClear(string extension_id) => ();
++};
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index b892132ffd..b1541207c6 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -11,6 +11,9 @@
+ #include "base/functional/bind.h"
+ #include "base/strings/string_util.h"
+ #include "content/public/renderer/render_frame.h"
++#include "gin/arguments.h"
++#include "gin/converter.h"
++#include "gin/function_template.h"
+ #include "content/public/renderer/render_frame_observer.h"
+ #include "content/shell/common/render_frame_test_helper.mojom.h"
+ #include "content/shell/common/shell_switches.h"
+@@ -119,27 +122,25 @@ bool ScriptMatchesUrl(const mojom::ContentScript& script, const GURL& url) {
+   return false;
+ }
+ 
+-// The `chrome.*` API shim injected into an extension page's main world (E5).
+-// Pure JS: runtime.id/getURL are trivial; storage.local is backed by the
+-// extension origin's localStorage (so it persists per-extension with no browser
+-// plumbing); runtime messaging is delivered between same-origin extension
+-// contexts via the localStorage `storage` event. `__EXTENSION_ID__` is replaced
+-// with the real id before injection.
++// The `chrome.*` API shim injected into an extension page's main world. Returned
++// as a function expression taking the native bridge object `__api` (installed by
++// InstallChromeApi); the caller runs it and invokes it with that object so the
++// bridge never leaks onto the page's global.
++//
++// runtime.id/getURL are trivial JS; `chrome.storage.local` is now backed by the
++// browser via `__api` (Wield W1a) so an extension's data is one store shared
++// across all its contexts and persisted by the browser. runtime messaging is
++// still delivered between same-origin extension contexts via the localStorage
++// `storage` event (browser-backed messaging arrives in W1b). `__EXTENSION_ID__`
++// is replaced with the real id before injection.
+ std::string BuildChromeShim(const std::string& extension_id) {
+   static const char kShim[] = R"JS(
+-(function() {
++(function(__api) {
+   if (window.chrome && window.chrome.runtime && window.chrome.runtime.id) {
+     return;
+   }
+   var EXT_ID = "__EXTENSION_ID__";
+   var NS = "__shellext_" + EXT_ID;
+-  function readAll() {
+-    try { return JSON.parse(localStorage.getItem(NS) || "{}"); }
+-    catch (e) { return {}; }
+-  }
+-  function writeAll(o) {
+-    try { localStorage.setItem(NS, JSON.stringify(o)); } catch (e) {}
+-  }
+   var chrome = window.chrome || {};
+ 
+   chrome.runtime = chrome.runtime || {};
+@@ -177,44 +178,80 @@ std::string BuildChromeShim(const std::string& extension_id) {
+     });
+   });
+ 
++  // Browser-backed chrome.storage.local (Wield W1a). The native bridge stores
++  // and returns the extension's whole blob as JSON; the get(keys)/defaults
++  // semantics stay here in JS.
+   chrome.storage = chrome.storage || {};
++  var changeListeners = [];
++  function fireChanges(changes) {
++    if (!changeListeners.length) return;
++    changeListeners.slice().forEach(function(fn) {
++      try { fn(changes, "local"); } catch (_) {}
++    });
++  }
+   chrome.storage.local = {
+     get: function(keys, cb) {
+-      var all = readAll(), result = {};
+-      if (keys == null) {
+-        result = all;
+-      } else if (typeof keys === "string") {
+-        if (keys in all) result[keys] = all[keys];
+-      } else if (Array.isArray(keys)) {
+-        keys.forEach(function(k) { if (k in all) result[k] = all[k]; });
+-      } else if (typeof keys === "object") {
+-        Object.keys(keys).forEach(function(k) {
+-          result[k] = (k in all) ? all[k] : keys[k];
+-        });
++      if (typeof keys === "function" && cb === undefined) {
++        cb = keys; keys = null;
+       }
+-      if (typeof cb === "function") { setTimeout(function() { cb(result); }, 0); }
+-      return Promise.resolve(result);
++      var p = __api.storageGet(EXT_ID).then(function(jsonStr) {
++        var all;
++        try { all = JSON.parse(jsonStr) || {}; } catch (e) { all = {}; }
++        var result = {};
++        if (keys == null) {
++          result = all;
++        } else if (typeof keys === "string") {
++          if (keys in all) result[keys] = all[keys];
++        } else if (Array.isArray(keys)) {
++          keys.forEach(function(k) { if (k in all) result[k] = all[k]; });
++        } else if (typeof keys === "object") {
++          Object.keys(keys).forEach(function(k) {
++            result[k] = (k in all) ? all[k] : keys[k];
++          });
++        }
++        if (typeof cb === "function") cb(result);
++        return result;
++      });
++      return p;
+     },
+     set: function(items, cb) {
+-      var all = readAll();
+-      Object.keys(items || {}).forEach(function(k) { all[k] = items[k]; });
+-      writeAll(all);
+-      if (typeof cb === "function") { setTimeout(cb, 0); }
+-      return Promise.resolve();
++      items = items || {};
++      var p = __api.storageSet(EXT_ID, JSON.stringify(items)).then(function() {
++        var changes = {};
++        Object.keys(items).forEach(function(k) {
++          changes[k] = { newValue: items[k] };
++        });
++        fireChanges(changes);
++        if (typeof cb === "function") cb();
++      });
++      return p;
+     },
+     remove: function(keys, cb) {
+-      var all = readAll();
+-      (Array.isArray(keys) ? keys : [keys]).forEach(function(k) {
+-        delete all[k];
++      var arr = Array.isArray(keys) ? keys : [keys];
++      var p = __api.storageRemove(EXT_ID, JSON.stringify(arr)).then(function() {
++        var changes = {};
++        arr.forEach(function(k) { changes[k] = {}; });
++        fireChanges(changes);
++        if (typeof cb === "function") cb();
+       });
+-      writeAll(all);
+-      if (typeof cb === "function") { setTimeout(cb, 0); }
+-      return Promise.resolve();
++      return p;
+     },
+     clear: function(cb) {
+-      writeAll({});
+-      if (typeof cb === "function") { setTimeout(cb, 0); }
+-      return Promise.resolve();
++      var p = __api.storageClear(EXT_ID).then(function() {
++        if (typeof cb === "function") cb();
++      });
++      return p;
++    }
++  };
++  // Many extensions use chrome.storage.sync; back it with the same local store.
++  chrome.storage.sync = chrome.storage.local;
++  chrome.storage.onChanged = {
++    addListener: function(fn) {
++      if (typeof fn === "function") changeListeners.push(fn);
++    },
++    removeListener: function(fn) {
++      var i = changeListeners.indexOf(fn);
++      if (i >= 0) changeListeners.splice(i, 1);
+     }
+   };
+ 
+@@ -227,7 +264,7 @@ std::string BuildChromeShim(const std::string& extension_id) {
+   };
+ 
+   window.chrome = chrome;
+-})();
++})
+ )JS";
+   std::string shim(kShim);
+   base::ReplaceSubstringsAfterOffset(&shim, 0, "__EXTENSION_ID__",
+@@ -235,6 +272,48 @@ std::string BuildChromeShim(const std::string& extension_id) {
+   return shim;
+ }
+ 
++// Resolves `resolver` (in `context`) with a v8 string built from `value`. Bound
++// into the ExtensionApi.StorageGet reply; runs on the renderer main thread.
++void ResolveWithString(v8::Isolate* isolate,
++                       v8::Global<v8::Context> context_global,
++                       v8::Global<v8::Promise::Resolver> resolver_global,
++                       const std::string& value) {
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = context_global.Get(isolate);
++  v8::Context::Scope context_scope(context);
++  // Blink runs V8 with the scoped-microtask policy, so resolving a promise
++  // (which enqueues microtasks) must happen inside a MicrotasksScope.
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
++  v8::Local<v8::String> v8str;
++  if (!v8::String::NewFromUtf8(isolate, value.c_str(), v8::NewStringType::kNormal,
++                               value.size())
++           .ToLocal(&v8str)) {
++    return;
++  }
++  // Resolution failure (e.g. detached context) is non-fatal; swallow it.
++  if (resolver->Resolve(context, v8str).IsNothing()) {
++    return;
++  }
++}
++
++// Resolves `resolver` with undefined. Bound into the set/remove/clear replies.
++void ResolveVoid(v8::Isolate* isolate,
++                 v8::Global<v8::Context> context_global,
++                 v8::Global<v8::Promise::Resolver> resolver_global) {
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = context_global.Get(isolate);
++  v8::Context::Scope context_scope(context);
++  // See ResolveWithString: promise resolution needs an open MicrotasksScope.
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
++  if (resolver->Resolve(context, v8::Undefined(isolate)).IsNothing()) {
++    return;
++  }
++}
++
+ }  // namespace
+ 
+ ShellRenderFrameObserver::ShellRenderFrameObserver(RenderFrame* render_frame)
+@@ -344,9 +423,9 @@ void ShellRenderFrameObserver::InjectForRunAt(
+ void ShellRenderFrameObserver::DidCreateScriptContext(
+     v8::Local<v8::Context> context,
+     int32_t world_id) {
+-  // E5 installs the chrome.* shim only in extension pages' main world (popup,
+-  // options, background). Content-script worlds get it once a browser-backed
+-  // API bridge lands.
++  // W1a installs the chrome.* API (incl. browser-backed storage) only in
++  // extension pages' main world (popup, options, background). Content-script
++  // isolated worlds get it in W1b once messaging + the world→extension map land.
+   if (world_id != 0) {
+     return;
+   }
+@@ -359,12 +438,45 @@ void ShellRenderFrameObserver::DidCreateScriptContext(
+     return;
+   }
+ 
+-  std::string shim = BuildChromeShim(std::string(url.host()));
++  InstallChromeApi(context, std::string(url.host()));
++}
+ 
++void ShellRenderFrameObserver::InstallChromeApi(
++    v8::Local<v8::Context> context,
++    const std::string& extension_id) {
+   v8::Isolate* isolate = v8::Isolate::GetCurrent();
+   v8::HandleScope handle_scope(isolate);
+   v8::Context::Scope context_scope(context);
+   v8::TryCatch try_catch(isolate);
++
++  // Build the native bridge object (chrome.storage transport) bound to this
++  // frame's observer; it is passed into the shim function so it never lands on
++  // the page's global.
++  v8::Local<v8::Object> api = v8::Object::New(isolate);
++  auto install_fn = [&](const char* name,
++                        v8::Local<v8::Value> (ShellRenderFrameObserver::*method)(
++                            gin::Arguments*)) {
++    // base::Unretained is safe: these functions live in the frame's v8 context,
++    // which is torn down before the RenderFrame (and thus this observer), so
++    // they are never invoked after `this` is gone. (A WeakPtr can't be used —
++    // base forbids binding one to a method with a non-void return.)
++    v8::Local<v8::Function> fn;
++    if (!gin::CreateFunctionTemplate(
++             isolate, base::BindRepeating(method, base::Unretained(this)))
++             ->GetFunction(context)
++             .ToLocal(&fn)) {
++      return;
++    }
++    if (api->Set(context, gin::StringToSymbol(isolate, name), fn).IsNothing()) {
++      return;
++    }
++  };
++  install_fn("storageGet", &ShellRenderFrameObserver::StorageGet);
++  install_fn("storageSet", &ShellRenderFrameObserver::StorageSet);
++  install_fn("storageRemove", &ShellRenderFrameObserver::StorageRemove);
++  install_fn("storageClear", &ShellRenderFrameObserver::StorageClear);
++
++  std::string shim = BuildChromeShim(extension_id);
+   v8::Local<v8::String> source;
+   if (!v8::String::NewFromUtf8(isolate, shim.c_str(),
+                                v8::NewStringType::kNormal, shim.size())
+@@ -375,11 +487,116 @@ void ShellRenderFrameObserver::DidCreateScriptContext(
+   if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+     return;
+   }
+-  v8::Local<v8::Value> result;
++  v8::Local<v8::Value> fn_value;
+   // Errors in the shim are non-fatal; just swallow them.
+-  if (!script->Run(context).ToLocal(&result)) {
++  if (!script->Run(context).ToLocal(&fn_value) || !fn_value->IsFunction()) {
+     return;
+   }
++  v8::Local<v8::Function> shim_fn = fn_value.As<v8::Function>();
++  v8::Local<v8::Value> argv[] = {api};
++  v8::Local<v8::Value> ignored;
++  if (!shim_fn->Call(context, context->Global(), 1, argv).ToLocal(&ignored)) {
++    return;
++  }
++}
++
++void ShellRenderFrameObserver::EnsureExtensionApi() {
++  if (!extension_api_.is_bound()) {
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        extension_api_.BindNewPipeAndPassReceiver());
++  }
++}
++
++v8::Local<v8::Value> ShellRenderFrameObserver::StorageGet(
++    gin::Arguments* args) {
++  v8::Isolate* isolate = args->isolate();
++  std::string extension_id;
++  args->GetNext(&extension_id);
++
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureExtensionApi();
++  extension_api_->StorageGet(
++      extension_id,
++      base::BindOnce(&ResolveWithString, isolate,
++                     v8::Global<v8::Context>(isolate, context),
++                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellRenderFrameObserver::StorageSet(
++    gin::Arguments* args) {
++  v8::Isolate* isolate = args->isolate();
++  std::string extension_id;
++  std::string items_json;
++  args->GetNext(&extension_id);
++  args->GetNext(&items_json);
++
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureExtensionApi();
++  extension_api_->StorageSet(
++      extension_id, items_json,
++      base::BindOnce(&ResolveVoid, isolate,
++                     v8::Global<v8::Context>(isolate, context),
++                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellRenderFrameObserver::StorageRemove(
++    gin::Arguments* args) {
++  v8::Isolate* isolate = args->isolate();
++  std::string extension_id;
++  std::string keys_json;
++  args->GetNext(&extension_id);
++  args->GetNext(&keys_json);
++
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureExtensionApi();
++  extension_api_->StorageRemove(
++      extension_id, keys_json,
++      base::BindOnce(&ResolveVoid, isolate,
++                     v8::Global<v8::Context>(isolate, context),
++                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellRenderFrameObserver::StorageClear(
++    gin::Arguments* args) {
++  v8::Isolate* isolate = args->isolate();
++  std::string extension_id;
++  args->GetNext(&extension_id);
++
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureExtensionApi();
++  extension_api_->StorageClear(
++      extension_id,
++      base::BindOnce(&ResolveVoid, isolate,
++                     v8::Global<v8::Context>(isolate, context),
++                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
++  return promise;
+ }
+ 
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index 2fb6aa772c..2bdd0ceacb 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -9,8 +9,14 @@
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "content/public/renderer/render_frame_observer.h"
++#include "content/shell/common/shell_extension_api.mojom.h"
+ #include "content/shell/common/shell_extension_scripts.mojom.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#include "v8/include/v8-forward.h"
++
++namespace gin {
++class Arguments;
++}  // namespace gin
+ 
+ namespace content {
+ 
+@@ -35,11 +41,28 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void DidDispatchDOMContentLoadedEvent() override;
+   void DidFinishLoad() override;
+ 
+-  // Injects the `chrome.*` API shim into extension pages' main world (Graft
+-  // epic, E5).
++  // Injects the `chrome.*` API into extension pages' main world (Graft epic, E5;
++  // browser-backed storage transport added in Wield W1a).
+   void DidCreateScriptContext(v8::Local<v8::Context> context,
+                               int32_t world_id) override;
+ 
++  // Installs the native `chrome.storage` bridge object + the JS `chrome.*` shim
++  // into `context` for the extension identified by `extension_id` (Wield W1a).
++  void InstallChromeApi(v8::Local<v8::Context> context,
++                        const std::string& extension_id);
++
++  // gin-bound native functions backing `chrome.storage.local`. Each issues an
++  // async Mojo request to the browser-side ExtensionApi and returns a JS Promise
++  // (resolved with the store JSON for get, undefined otherwise). The extension
++  // id is passed as the first JS argument.
++  v8::Local<v8::Value> StorageGet(gin::Arguments* args);
++  v8::Local<v8::Value> StorageSet(gin::Arguments* args);
++  v8::Local<v8::Value> StorageRemove(gin::Arguments* args);
++  v8::Local<v8::Value> StorageClear(gin::Arguments* args);
++
++  // Lazily binds the per-frame ExtensionApi remote to the browser.
++  void EnsureExtensionApi();
++
+   // Fetches the installed extensions' content scripts from the browser (once
+   // per frame) and caches them.
+   void RequestContentScripts();
+@@ -52,6 +75,8 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void InjectForRunAt(mojom::ContentScriptRunAt run_at);
+ 
+   mojo::Remote<mojom::ShellExtensionScripts> extension_scripts_;
++  // Per-frame transport for the browser-backed `chrome.*` APIs (Wield W1a).
++  mojo::Remote<mojom::ExtensionApi> extension_api_;
+   std::vector<mojom::ContentScriptPtr> content_scripts_;
+   bool scripts_loaded_ = false;
+   // Bitmask of ContentScriptRunAt stages already reached for the current
