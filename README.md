@@ -120,7 +120,12 @@ Run it:
   `chrome.storage.local`) is now installed into **content scripts' isolated worlds** too, so a content
   script running on any web page reads/writes the same browser-backed store as the extension's
   background/popup (verified: a content script on example.com reads the background's value and writes
-  back). Next: browser-routed `chrome.runtime` messaging across contexts (W1c), then
+  back). **W1c — `chrome.runtime` messaging:** `chrome.runtime.sendMessage`/`onMessage` is now routed by
+  the browser across **all** of an extension's contexts (content script ↔ background ↔ popup, across
+  origins), via an `ExtensionApiClient` push channel + a per-extension context registry, with the
+  `chrome.*` runtime refactored to one bindings object per v8 context (verified: a content script
+  messages the background, and a popup broadcast lands in the content script's `onMessage`). This
+  completes the **W1 keystone** (storage + content-script `chrome.*` + cross-context messaging). Next:
   `chrome.tabs`/`chrome.scripting` and the `obsidian://` hand-off toward the clip.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the

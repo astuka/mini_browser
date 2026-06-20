@@ -380,6 +380,31 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   with the extension's background/popup/options. **Next (W1c):** browser-routed `chrome.runtime`
   messaging across all contexts (the `ExtensionApiClient` browser→renderer push + a per-extension
   context registry).
+- **`0031-chrome-runtime-messaging.patch`** — **browser-routed `chrome.runtime` messaging across all
+  of an extension's contexts** (Wield epic, **W1c** — completes the W1 keystone). Replaces W1a/W1b's
+  localStorage/stub messaging with a real browser path so `chrome.runtime.sendMessage` from any context
+  (content script, popup, background) reaches `chrome.runtime.onMessage` in the extension's *other*
+  contexts — including content scripts on arbitrary web pages. Adds a Mojo `ExtensionApiClient`
+  interface (browser→renderer `OnMessage` push) plus `RegisterContext` + `SendMessage` on `ExtensionApi`;
+  the browser keeps a process-global registry `map<extension_id, set<context>>`, stamps the sender id
+  itself (anti-spoof), and fans a message out to every other registered context of the extension. The
+  `chrome.*` runtime is **refactored to one bindings object per v8 context** (new
+  `ShellExtensionContextBindings`): each context binds its own ExtensionApi pipe, registers with the
+  browser, hosts the storage + messaging gin functions, and receives pushed messages on its
+  ExtensionApiClient receiver to dispatch into that context's `onMessage` listeners. The observer now
+  just creates one per context in `DidCreateScriptContext` and destroys it in
+  `WillReleaseScriptContext` (which drops the pipes and de-registers). `ShellExtensionApiImpl` becomes
+  per-context/stateful and self-cleans from the registry on disconnect. The shim's old localStorage
+  messaging + the W1b `messaging_enabled` gate are removed (all contexts now use the native path).
+  Touches `shell_extension_api.mojom`, `shell_extension_api_impl.{cc,h}`,
+  `shell_render_frame_observer.{cc,h}`, `content/shell/BUILD.gn`, and adds
+  `shell_extension_context_bindings.{cc,h}`; stacks on `0030`. **Verified** with a messaging test
+  extension: a content script on example.com `sendMessage`s the background (recorded in Local State with
+  the browser-stamped `sender.id`), and a popup broadcast is delivered to that content script's
+  `onMessage` (shown live in an on-page banner) — messaging works content↔background↔popup, across
+  origins, excluding the sender. **W1 (the `chrome.*` transport keystone) is now complete:** storage +
+  content-script `chrome.*` + cross-context runtime messaging. (`sendResponse`/response routing is not
+  yet implemented; that and `chrome.tabs`/`scripting` come next.)
 
 ## Workflow
 
