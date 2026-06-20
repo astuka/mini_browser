@@ -128,8 +128,13 @@ Run it:
   completes the **W1 keystone** (storage + content-script `chrome.*` + cross-context messaging).
   **W2 — `chrome.tabs`:** a popup/background can now `query`/`get`/`create`/`update` tabs (e.g.
   `tabs.query({active:true})` to find the active tab), backed by a TabNode↔tabId bridge into the tab
-  strip (verified: query active/all, create + activate, and navigate the active tab). Next:
-  `chrome.scripting.executeScript`/`activeTab` (W3) and the `obsidian://` hand-off toward the clip.
+  strip (verified: query active/all, create + activate, and navigate the active tab). **W3 —
+  `chrome.scripting.executeScript`:** an extension can now run a function in a tab's frame and get the
+  result back — the page-extraction mechanism the Obsidian Clipper uses. The browser routes to the
+  target tab's renderer (via a per-frame `ExtensionScriptRunner`), runs the code in the extension's
+  isolated world, and returns the JSON-serialized result as chrome's `[{frameId, result}]` (verified: a
+  popup extracted `{title, url, h1, textLength}` live from the active page). Next: the `obsidian://`
+  external-protocol hand-off (W4) → an actual end-to-end clip attempt.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

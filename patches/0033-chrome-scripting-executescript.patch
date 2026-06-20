@@ -1,0 +1,410 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 372705de8e..5e89a1a385 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -1106,6 +1106,7 @@ mojom("content_browsertests_mojom") {
+     "common/power_monitor_test.mojom",
+     "common/render_frame_test_helper.mojom",
+     "common/shell_extension_api.mojom",
++    "common/shell_extension_script_runner.mojom",
+     "common/shell_extension_scripts.mojom",
+   ]
+   public_deps = [
+diff --git a/content/shell/browser/shell_extension_api_impl.cc b/content/shell/browser/shell_extension_api_impl.cc
+index e9f18abcc4..d18ddf234b 100644
+--- a/content/shell/browser/shell_extension_api_impl.cc
++++ b/content/shell/browser/shell_extension_api_impl.cc
+@@ -4,20 +4,27 @@
+ 
+ #include "content/shell/browser/shell_extension_api_impl.h"
+ 
++#include <functional>
+ #include <map>
+ #include <optional>
+ #include <set>
+ #include <string>
+ #include <utility>
+ 
++#include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
+ #include "content/shell/browser/shell_extension_tabs.h"
++#include "content/shell/common/shell_extension_script_runner.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "services/service_manager/public/cpp/interface_provider.h"
+ 
+ namespace content {
+ 
+@@ -51,6 +58,23 @@ std::string TabInfoToJson(const ShellTabInfo& tab, int index) {
+   return json;
+ }
+ 
++// The isolated world an extension's scripts run in. Must match the formula in
++// shell_extension_scripts_impl.cc so executeScript shares the extension's
++// content-script world (Wield W3).
++int32_t ExtensionWorldId(const std::string& extension_id) {
++  return 1000 + static_cast<int32_t>(std::hash<std::string>{}(extension_id) %
++                                     1000);
++}
++
++// Relays the target frame's ExecuteScript reply back to the original caller,
++// keeping the per-frame ScriptRunner remote alive until the reply arrives.
++void OnExecuteScriptResult(
++    mojo::Remote<mojom::ExtensionScriptRunner> runner,
++    mojom::ExtensionApi::ExecuteScriptCallback callback,
++    const std::string& result_json) {
++  std::move(callback).Run(result_json);
++}
++
+ }  // namespace
+ 
+ // static
+@@ -257,4 +281,29 @@ void ShellExtensionApiImpl::TabsUpdate(int32_t tab_id,
+   std::move(callback).Run("null");
+ }
+ 
++void ShellExtensionApiImpl::ExecuteScript(int32_t tab_id,
++                                          const std::string& code,
++                                          ExecuteScriptCallback callback) {
++#if BUILDFLAG(IS_MAC)
++  WebContents* web_contents = ShellGetWebContentsForTab(tab_id);
++  RenderFrameHost* rfh =
++      web_contents ? web_contents->GetPrimaryMainFrame() : nullptr;
++  if (!rfh) {
++    std::move(callback).Run(R"({"ok":false,"error":"no tab"})");
++    return;
++  }
++  // Reach the target frame's renderer and run the code in this extension's world.
++  mojo::Remote<mojom::ExtensionScriptRunner> runner;
++  rfh->GetRemoteInterfaces()->GetInterface(
++      runner.BindNewPipeAndPassReceiver());
++  mojom::ExtensionScriptRunner* runner_raw = runner.get();
++  runner_raw->ExecuteScript(
++      code, ExtensionWorldId(extension_id_),
++      base::BindOnce(&OnExecuteScriptResult, std::move(runner),
++                     std::move(callback)));
++#else
++  std::move(callback).Run(R"({"ok":false,"error":"unsupported"})");
++#endif
++}
++
+ }  // namespace content
+diff --git a/content/shell/browser/shell_extension_api_impl.h b/content/shell/browser/shell_extension_api_impl.h
+index e210f5daeb..71fe8d0de2 100644
+--- a/content/shell/browser/shell_extension_api_impl.h
++++ b/content/shell/browser/shell_extension_api_impl.h
+@@ -59,6 +59,9 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+   void TabsUpdate(int32_t tab_id,
+                   const std::string& update_json,
+                   TabsUpdateCallback callback) override;
++  void ExecuteScript(int32_t tab_id,
++                     const std::string& code,
++                     ExecuteScriptCallback callback) override;
+ 
+  private:
+   // Set once via RegisterContext; identifies which extension this context (and
+diff --git a/content/shell/browser/shell_extension_tabs.h b/content/shell/browser/shell_extension_tabs.h
+index 4f570d14df..249d16fd26 100644
+--- a/content/shell/browser/shell_extension_tabs.h
++++ b/content/shell/browser/shell_extension_tabs.h
+@@ -10,6 +10,8 @@
+ 
+ namespace content {
+ 
++class WebContents;
++
+ // A snapshot of one open tab, for the `chrome.tabs` API (Wield epic, W2). Built
+ // from the tabbed UI's tab model (the mac TabbedShellController) so the
+ // browser-side ExtensionApi can answer tabs.query/get and report created/updated
+@@ -33,6 +35,11 @@ int ShellCreateTab(const std::string& url);
+ // false if no such tab. `tab_id` < 0 targets the active tab.
+ bool ShellUpdateTab(int tab_id, const std::string& url, bool make_active);
+ 
++// Returns the WebContents backing tab `tab_id` (or the active tab if `tab_id`
++// < 0), or null if none. Used to reach a tab's frame for
++// chrome.scripting.executeScript (Wield W3).
++WebContents* ShellGetWebContentsForTab(int tab_id);
++
+ }  // namespace content
+ 
+ #endif  // CONTENT_SHELL_BROWSER_SHELL_EXTENSION_TABS_H_
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 6008a351e1..bff88c1abe 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -267,6 +267,7 @@ - (int)extensionCreateTabWithURL:(const std::string&)url;
+ - (BOOL)extensionUpdateTab:(int)tabId
+                        url:(const std::string&)url
+                 makeActive:(BOOL)makeActive;
++- (content::WebContents*)extensionWebContentsForTab:(int)tabId;
+ - (void)setURLString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setTitleString:(NSString*)s forShell:(content::Shell*)shell;
+ - (void)setEnabled:(BOOL)enabled
+@@ -932,6 +933,14 @@ - (BOOL)extensionUpdateTab:(int)tabId
+   return YES;
+ }
+ 
++- (content::WebContents*)extensionWebContentsForTab:(int)tabId {
++  TabNode* node = tabId < 0 ? _activeTab : [self tabNodeForId:tabId in:_tabs];
++  if (!node || node->kind != TabNodeKindTab || !node->shell) {
++    return nullptr;
++  }
++  return node->shell->web_contents();
++}
++
+ - (void)addTabForShell:(content::Shell*)shell {
+   TabNode* tab = [[TabNode alloc] init];
+   tab->shell = shell;
+@@ -3466,6 +3475,13 @@ bool ShellUpdateTab(int tab_id, const std::string& url, bool make_active) {
+                                    makeActive:make_active];
+ }
+ 
++WebContents* ShellGetWebContentsForTab(int tab_id) {
++  if (!g_tab_controller) {
++    return nullptr;
++  }
++  return [g_tab_controller extensionWebContentsForTab:tab_id];
++}
++
+ // These are required by the header (it declares the members), but the tab
+ // controller above holds all real state, so they stay empty.
+ struct ShellPlatformDelegate::ShellData {};
+diff --git a/content/shell/common/shell_extension_api.mojom b/content/shell/common/shell_extension_api.mojom
+index fb439b5ba3..b2908d5a60 100644
+--- a/content/shell/common/shell_extension_api.mojom
++++ b/content/shell/common/shell_extension_api.mojom
+@@ -66,4 +66,10 @@ interface ExtensionApi {
+   // Updates tab `tab_id` from `update_json` ({"url":...,"active":...}); a
+   // negative `tab_id` targets the active tab. Returns the tab as JSON, or "null".
+   TabsUpdate(int32 tab_id, string update_json) => (string tab_json);
++
++  // chrome.scripting.executeScript (Wield W3). Runs `code` (a JS expression) in
++  // tab `tab_id`'s frame, in this extension's isolated world, and returns a JSON
++  // envelope {"ok":true,"result":<value>} / {"ok":false,"error":"..."}. A
++  // negative `tab_id` targets the active tab.
++  ExecuteScript(int32 tab_id, string code) => (string result_json);
+ };
+diff --git a/content/shell/common/shell_extension_script_runner.mojom b/content/shell/common/shell_extension_script_runner.mojom
+new file mode 100644
+index 0000000000..3b3c979daa
+--- /dev/null
++++ b/content/shell/common/shell_extension_script_runner.mojom
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module content.mojom;
++
++// Renderer-implemented, bound per RenderFrame. The browser uses it to run an
++// extension's code in a frame and get the result back, backing
++// chrome.scripting.executeScript (Wield epic, W3).
++interface ExtensionScriptRunner {
++  // Evaluates `code` (a JS expression) in isolated world `world_id` and returns
++  // a JSON string of the form {"ok":true,"result":<value>} or
++  // {"ok":false,"error":"..."}. The expression's value is JSON-serialized in the
++  // target world; non-serializable results come back as null.
++  ExecuteScript(string code, int32 world_id) => (string result_json);
++};
+diff --git a/content/shell/renderer/shell_extension_context_bindings.cc b/content/shell/renderer/shell_extension_context_bindings.cc
+index f5e6e8d1c2..8e7b53eeaf 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.cc
++++ b/content/shell/renderer/shell_extension_context_bindings.cc
+@@ -198,6 +198,38 @@ std::string BuildChromeShim(const std::string& extension_id) {
+     }
+   };
+ 
++  // chrome.scripting.executeScript (Wield W3): serialize the injected function
++  // (+ args) into an expression the browser runs in the target tab's frame, then
++  // shape the reply like chrome (an array of {frameId, result}). `files`/`world`
++  // aren't supported yet. activeTab needs no enforcement here (no host perms).
++  chrome.scripting = {
++    executeScript: function(injection, cb) {
++      injection = injection || {};
++      var target = injection.target || {};
++      var tabId = (typeof target.tabId === "number") ? target.tabId : -1;
++      var fn = injection.func || injection.function;
++      if (typeof fn !== "function") {
++        var empty = Promise.resolve([]);
++        if (typeof cb === "function") empty.then(cb);
++        return empty;
++      }
++      var code = "(" + fn.toString() + ").apply(null," +
++                 JSON.stringify(injection.args || []) + ")";
++      var p = __api.executeScript(tabId | 0, code).then(function(j) {
++        var env;
++        try { env = JSON.parse(j); } catch (e) { env = { ok: false, error: "parse" }; }
++        if (!env.ok) {
++          if (typeof cb === "function") cb([]);
++          return Promise.reject(new Error(env.error || "executeScript failed"));
++        }
++        var arr = [{ frameId: 0, result: env.result }];
++        if (typeof cb === "function") cb(arr);
++        return arr;
++      });
++      return p;
++    }
++  };
++
+   // Minimal chrome.action stubs (full support arrives later in the epic).
+   chrome.action = chrome.action || {
+     setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
+@@ -314,6 +346,7 @@ void ShellExtensionContextBindings::Install() {
+   install_fn("tabsGet", &ShellExtensionContextBindings::TabsGet);
+   install_fn("tabsCreate", &ShellExtensionContextBindings::TabsCreate);
+   install_fn("tabsUpdate", &ShellExtensionContextBindings::TabsUpdate);
++  install_fn("executeScript", &ShellExtensionContextBindings::ExecuteScript);
+ 
+   // setMessageDispatcher returns void, so bind it directly.
+   {
+@@ -580,4 +613,27 @@ v8::Local<v8::Value> ShellExtensionContextBindings::TabsUpdate(
+   return promise;
+ }
+ 
++v8::Local<v8::Value> ShellExtensionContextBindings::ExecuteScript(
++    gin::Arguments* args) {
++  int32_t tab_id = -1;
++  std::string code;
++  args->GetNext(&tab_id);
++  args->GetNext(&code);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->ExecuteScript(
++      tab_id, code,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_extension_context_bindings.h b/content/shell/renderer/shell_extension_context_bindings.h
+index b38532ff33..3572e5771c 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.h
++++ b/content/shell/renderer/shell_extension_context_bindings.h
+@@ -71,6 +71,10 @@ class ShellExtensionContextBindings : public mojom::ExtensionApiClient {
+   v8::Local<v8::Value> TabsCreate(gin::Arguments* args);
+   v8::Local<v8::Value> TabsUpdate(gin::Arguments* args);
+ 
++  // chrome.scripting.executeScript (Wield W3). Returns a JS Promise resolving
++  // with the target frame's result envelope as JSON.
++  v8::Local<v8::Value> ExecuteScript(gin::Arguments* args);
++
+   // Lazily binds the ExtensionApi pipe to the browser.
+   void EnsureApi();
+ 
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index f76858a2e0..e18204e1af 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -151,6 +151,12 @@ void ShellRenderFrameObserver::OnInterfaceRequestForFrame(
+                              std::move(*interface_pipe)));
+     return;
+   }
++  if (interface_name == mojom::ExtensionScriptRunner::Name_) {
++    script_runner_receivers_.Add(
++        this, mojo::PendingReceiver<mojom::ExtensionScriptRunner>(
++                  std::move(*interface_pipe)));
++    return;
++  }
+ }
+ 
+ void ShellRenderFrameObserver::DidCommitProvisionalLoad(
+@@ -274,4 +280,37 @@ void ShellRenderFrameObserver::WillReleaseScriptContext(
+   context_bindings_.erase(world_id);
+ }
+ 
++void ShellRenderFrameObserver::ExecuteScript(const std::string& code,
++                                             int32_t world_id,
++                                             ExecuteScriptCallback callback) {
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (!frame) {
++    std::move(callback).Run(R"({"ok":false,"error":"no frame"})");
++    return;
++  }
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  v8::HandleScope handle_scope(isolate);
++
++  // Evaluate the caller's expression in the extension's isolated world and bring
++  // the value back as a JSON string (serialized in that world, so we never need
++  // its v8 context here). Errors are reported in the same envelope.
++  std::string wrapped =
++      "(function(){try{var r=(" + code +
++      ");return JSON.stringify({ok:true,result:(r===undefined?null:r)});}"
++      "catch(e){return "
++      "JSON.stringify({ok:false,error:String((e&&e.message)||e)});}})()";
++
++  v8::Local<v8::Value> result =
++      frame->ExecuteScriptInIsolatedWorldAndReturnValue(
++          world_id, blink::WebScriptSource(blink::WebString::FromUtf8(wrapped)),
++          blink::BackForwardCacheAware::kPossiblyDisallow);
++  if (result.IsEmpty() || !result->IsString()) {
++    std::move(callback).Run(R"({"ok":false,"error":"no result"})");
++    return;
++  }
++  v8::String::Utf8Value utf8(isolate, result);
++  std::move(callback).Run(*utf8 ? std::string(*utf8, utf8.length())
++                                : std::string());
++}
++
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index 6c055cf85e..f94c1302d6 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -12,7 +12,9 @@
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "content/public/renderer/render_frame_observer.h"
++#include "content/shell/common/shell_extension_script_runner.mojom.h"
+ #include "content/shell/common/shell_extension_scripts.mojom.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "v8/include/v8-forward.h"
+ 
+@@ -20,7 +22,8 @@ namespace content {
+ 
+ class ShellExtensionContextBindings;
+ 
+-class ShellRenderFrameObserver : public RenderFrameObserver {
++class ShellRenderFrameObserver : public RenderFrameObserver,
++                                 public mojom::ExtensionScriptRunner {
+  public:
+   explicit ShellRenderFrameObserver(RenderFrame* frame);
+   ~ShellRenderFrameObserver() override;
+@@ -51,6 +54,12 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void WillReleaseScriptContext(v8::Local<v8::Context> context,
+                                 int32_t world_id) override;
+ 
++  // mojom::ExtensionScriptRunner (Wield W3): the browser calls this to run an
++  // extension's code in this frame for chrome.scripting.executeScript.
++  void ExecuteScript(const std::string& code,
++                     int32_t world_id,
++                     ExecuteScriptCallback callback) override;
++
+   // Fetches the installed extensions' content scripts from the browser (once
+   // per frame) and caches them.
+   void RequestContentScripts();
+@@ -63,6 +72,8 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void InjectForRunAt(mojom::ContentScriptRunAt run_at);
+ 
+   mojo::Remote<mojom::ShellExtensionScripts> extension_scripts_;
++  // Browser→renderer ExecuteScript requests for this frame (Wield W3).
++  mojo::ReceiverSet<mojom::ExtensionScriptRunner> script_runner_receivers_;
+   std::vector<mojom::ContentScriptPtr> content_scripts_;
+   // Maps a content-script isolated world id to the extension that owns it, so
+   // DidCreateScriptContext can install that extension's `chrome.*` into the

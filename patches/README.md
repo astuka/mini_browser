@@ -423,6 +423,28 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (`chrome.scripting.executeScript`) the active-tab id it targets. **Next (W3):** `chrome.scripting`/
   `activeTab` to run code in a tab and read its content (plus `sendResponse` so request/reply messaging
   works), toward the Obsidian clip.
+- **`0033-chrome-scripting-executescript.patch`** — **`chrome.scripting.executeScript`** (Wield epic,
+  **W3**) — run an extension's code in a tab's frame and get the result, the page-extraction mechanism
+  the Obsidian Clipper uses. Adds a renderer-implemented per-frame mojom `ExtensionScriptRunner`
+  (`ExecuteScript(code, world_id) => (result_json)`) that `ShellRenderFrameObserver` answers via
+  `WebLocalFrame::ExecuteScriptInIsolatedWorldAndReturnValue`, wrapping the expression in
+  `JSON.stringify({ok,result})` so the value comes back serialized (errors as `{ok:false,error}`).
+  `ExtensionApi` gains `ExecuteScript(tab_id, code) => (result_json)`: `ShellExtensionApiImpl` resolves
+  the tab → its `WebContents` → main `RenderFrameHost` (new `ShellGetWebContentsForTab` in the W2 tab
+  bridge), then reaches that frame's renderer via `GetRemoteInterfaces()` (the same browser→renderer
+  per-frame channel `RenderFrameTestHelper` uses) and runs the code in the extension's isolated world
+  (the same `1000 + hash(id)%1000` world content scripts use). The renderer adds
+  `chrome.scripting.executeScript` to the shim — it serializes `injection.func` + `args` into a call
+  expression, awaits the browser, and returns chrome's `[{frameId, result}]` shape — backed by a new
+  `executeScript` gin function. `activeTab` needs no enforcement (no host-permission checks); `files`
+  and `world:'MAIN'` aren't supported yet. Touches `shell_extension_api.mojom`,
+  `shell_extension_api_impl.{cc,h}`, `shell_extension_context_bindings.{cc,h}`,
+  `shell_render_frame_observer.{cc,h}`, `shell_extension_tabs.h`, `shell_platform_delegate_mac.mm`,
+  `content/shell/BUILD.gn`, and adds `shell_extension_script_runner.mojom`; stacks on `0032`.
+  **Verified** with a scripting test extension: the popup runs `executeScript({target:{tabId},func})`
+  against the active tab and gets back `[{frameId:0, result:{title,url,h1,textLength}}]` extracted live
+  from the page's DOM. **Next (W4):** `obsidian://` external-protocol launch (hand a built note URI to
+  the OS) → attempt the real end-to-end clip; likely `sendResponse` too.
 
 ## Workflow
 
