@@ -1,0 +1,236 @@
+diff --git a/content/shell/browser/shell_extension_scripts_impl.cc b/content/shell/browser/shell_extension_scripts_impl.cc
+index 12d3f3cec1..b3086a1ca2 100644
+--- a/content/shell/browser/shell_extension_scripts_impl.cc
++++ b/content/shell/browser/shell_extension_scripts_impl.cc
+@@ -87,6 +87,7 @@ std::vector<mojom::ContentScriptPtr> BuildContentScripts(
+       const base::DictValue& cs = entry.GetDict();
+ 
+       auto script = mojom::ContentScript::New();
++      script->extension_id = spec.id;
+       AppendStrings(cs.FindList("matches"), &script->matches);
+       AppendStrings(cs.FindList("exclude_matches"), &script->exclude_matches);
+       script->run_at = ParseRunAt(cs.FindString("run_at"));
+diff --git a/content/shell/common/shell_extension_scripts.mojom b/content/shell/common/shell_extension_scripts.mojom
+index e4ea6eb001..12b6badea5 100644
+--- a/content/shell/common/shell_extension_scripts.mojom
++++ b/content/shell/common/shell_extension_scripts.mojom
+@@ -17,6 +17,10 @@ enum ContentScriptRunAt {
+ // `exclude_matches` against each frame's URL and injects `js_sources` into the
+ // extension's isolated world at `run_at`.
+ struct ContentScript {
++  // The id of the extension that declared this script. Lets the renderer map an
++  // isolated world back to its extension so it can install that extension's
++  // `chrome.*` API into the content-script world (Wield W1b).
++  string extension_id;
+   array<string> matches;
+   array<string> exclude_matches;
+   array<string> js_sources;
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index b1541207c6..847bb6cd35 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -130,10 +130,12 @@ bool ScriptMatchesUrl(const mojom::ContentScript& script, const GURL& url) {
+ // runtime.id/getURL are trivial JS; `chrome.storage.local` is now backed by the
+ // browser via `__api` (Wield W1a) so an extension's data is one store shared
+ // across all its contexts and persisted by the browser. runtime messaging is
+-// still delivered between same-origin extension contexts via the localStorage
+-// `storage` event (browser-backed messaging arrives in W1b). `__EXTENSION_ID__`
+-// is replaced with the real id before injection.
+-std::string BuildChromeShim(const std::string& extension_id) {
++// delivered between same-origin extension contexts via the localStorage `storage`
++// event on extension pages (`messaging_enabled`), and stubbed in content-script
++// worlds until browser-routed messaging lands (W1c). `__EXTENSION_ID__` and
++// `__MESSAGING_ENABLED__` are substituted before injection.
++std::string BuildChromeShim(const std::string& extension_id,
++                            bool messaging_enabled) {
+   static const char kShim[] = R"JS(
+ (function(__api) {
+   if (window.chrome && window.chrome.runtime && window.chrome.runtime.id) {
+@@ -150,8 +152,13 @@ std::string BuildChromeShim(const std::string& extension_id) {
+            String(path == null ? "" : path).replace(/^\//, "");
+   };
+ 
+-  // Messaging across same-origin extension contexts (popup, options,
+-  // background) via a localStorage mailbox + the cross-document storage event.
++  // chrome.runtime messaging. On extension pages (MSG_PAGE) it crosses
++  // same-origin contexts (popup, options, background) via a localStorage mailbox
++  // + the cross-document storage event. In content-script worlds the page's
++  // localStorage is the wrong origin, so messaging is a no-op stub here until
++  // browser-routed messaging lands (W1c) — listeners are still accepted so
++  // extensions that register handlers load cleanly.
++  var MSG_PAGE = __MESSAGING_ENABLED__;
+   var listeners = [];
+   chrome.runtime.onMessage = {
+     addListener: function(fn) { if (typeof fn === "function") listeners.push(fn); },
+@@ -161,22 +168,26 @@ std::string BuildChromeShim(const std::string& extension_id) {
+     }
+   };
+   chrome.runtime.sendMessage = function(message, cb) {
+-    var envelope = { from: EXT_ID, message: message,
+-                     nonce: Date.now() + ":" + Math.random() };
+-    try { localStorage.setItem(NS + "_mailbox", JSON.stringify(envelope)); }
+-    catch (e) {}
++    if (MSG_PAGE) {
++      var envelope = { from: EXT_ID, message: message,
++                       nonce: Date.now() + ":" + Math.random() };
++      try { localStorage.setItem(NS + "_mailbox", JSON.stringify(envelope)); }
++      catch (e) {}
++    }
+     if (typeof cb === "function") { setTimeout(function() { cb(); }, 0); }
+     return Promise.resolve();
+   };
+-  window.addEventListener("storage", function(e) {
+-    if (e.key !== NS + "_mailbox" || !e.newValue) return;
+-    var env;
+-    try { env = JSON.parse(e.newValue); } catch (_) { return; }
+-    var sender = { id: EXT_ID };
+-    listeners.slice().forEach(function(fn) {
+-      try { fn(env.message, sender, function() {}); } catch (_) {}
++  if (MSG_PAGE) {
++    window.addEventListener("storage", function(e) {
++      if (e.key !== NS + "_mailbox" || !e.newValue) return;
++      var env;
++      try { env = JSON.parse(e.newValue); } catch (_) { return; }
++      var sender = { id: EXT_ID };
++      listeners.slice().forEach(function(fn) {
++        try { fn(env.message, sender, function() {}); } catch (_) {}
++      });
+     });
+-  });
++  }
+ 
+   // Browser-backed chrome.storage.local (Wield W1a). The native bridge stores
+   // and returns the extension's whole blob as JSON; the get(keys)/defaults
+@@ -269,6 +280,8 @@ std::string BuildChromeShim(const std::string& extension_id) {
+   std::string shim(kShim);
+   base::ReplaceSubstringsAfterOffset(&shim, 0, "__EXTENSION_ID__",
+                                      extension_id);
++  base::ReplaceSubstringsAfterOffset(&shim, 0, "__MESSAGING_ENABLED__",
++                                     messaging_enabled ? "true" : "false");
+   return shim;
+ }
+ 
+@@ -377,6 +390,15 @@ void ShellRenderFrameObserver::OnContentScripts(
+   content_scripts_ = std::move(scripts);
+   scripts_loaded_ = true;
+ 
++  // Map each content-script world back to its extension so DidCreateScriptContext
++  // can install that extension's chrome.* when the isolated world is created.
++  world_to_extension_.clear();
++  for (const mojom::ContentScriptPtr& script : content_scripts_) {
++    if (!script->extension_id.empty()) {
++      world_to_extension_[script->world_id] = script->extension_id;
++    }
++  }
++
+   // The scripts may have arrived after some run_at stages already fired for the
+   // current document — inject those now so nothing is missed.
+   for (mojom::ContentScriptRunAt run_at :
+@@ -423,27 +445,35 @@ void ShellRenderFrameObserver::InjectForRunAt(
+ void ShellRenderFrameObserver::DidCreateScriptContext(
+     v8::Local<v8::Context> context,
+     int32_t world_id) {
+-  // W1a installs the chrome.* API (incl. browser-backed storage) only in
+-  // extension pages' main world (popup, options, background). Content-script
+-  // isolated worlds get it in W1b once messaging + the world→extension map land.
+-  if (world_id != 0) {
+-    return;
+-  }
+-  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
+-  if (!frame) {
++  if (world_id == 0) {
++    // Main world: install chrome.* only for extension pages (popup, options,
++    // background), identified by the chrome-extension origin.
++    blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++    if (!frame) {
++      return;
++    }
++    GURL url = frame->GetDocument().Url();
++    if (!url.SchemeIs("chrome-extension") || url.host().empty()) {
++      return;
++    }
++    InstallChromeApi(context, std::string(url.host()),
++                     /*is_content_script=*/false);
+     return;
+   }
+-  GURL url = frame->GetDocument().Url();
+-  if (!url.SchemeIs("chrome-extension") || url.host().empty()) {
++
++  // Isolated world: if it's one of our content-script worlds, install the
++  // owning extension's chrome.* so the content script can use it (Wield W1b).
++  auto it = world_to_extension_.find(world_id);
++  if (it == world_to_extension_.end()) {
+     return;
+   }
+-
+-  InstallChromeApi(context, std::string(url.host()));
++  InstallChromeApi(context, it->second, /*is_content_script=*/true);
+ }
+ 
+ void ShellRenderFrameObserver::InstallChromeApi(
+     v8::Local<v8::Context> context,
+-    const std::string& extension_id) {
++    const std::string& extension_id,
++    bool is_content_script) {
+   v8::Isolate* isolate = v8::Isolate::GetCurrent();
+   v8::HandleScope handle_scope(isolate);
+   v8::Context::Scope context_scope(context);
+@@ -476,7 +506,8 @@ void ShellRenderFrameObserver::InstallChromeApi(
+   install_fn("storageRemove", &ShellRenderFrameObserver::StorageRemove);
+   install_fn("storageClear", &ShellRenderFrameObserver::StorageClear);
+ 
+-  std::string shim = BuildChromeShim(extension_id);
++  std::string shim =
++      BuildChromeShim(extension_id, /*messaging_enabled=*/!is_content_script);
+   v8::Local<v8::String> source;
+   if (!v8::String::NewFromUtf8(isolate, shim.c_str(),
+                                v8::NewStringType::kNormal, shim.size())
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index 2bdd0ceacb..0ba5037769 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -5,6 +5,8 @@
+ #ifndef CONTENT_SHELL_RENDERER_SHELL_RENDER_FRAME_OBSERVER_H_
+ #define CONTENT_SHELL_RENDERER_SHELL_RENDER_FRAME_OBSERVER_H_
+ 
++#include <map>
++#include <string>
+ #include <vector>
+ 
+ #include "base/memory/weak_ptr.h"
+@@ -41,15 +43,21 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void DidDispatchDOMContentLoadedEvent() override;
+   void DidFinishLoad() override;
+ 
+-  // Injects the `chrome.*` API into extension pages' main world (Graft epic, E5;
+-  // browser-backed storage transport added in Wield W1a).
++  // Injects the `chrome.*` API into an extension's contexts: extension pages'
++  // main world (Graft E5; browser-backed storage in Wield W1a) and, since Wield
++  // W1b, content scripts' isolated worlds.
+   void DidCreateScriptContext(v8::Local<v8::Context> context,
+                               int32_t world_id) override;
+ 
+   // Installs the native `chrome.storage` bridge object + the JS `chrome.*` shim
+   // into `context` for the extension identified by `extension_id` (Wield W1a).
++  // `is_content_script` selects the messaging variant: extension pages keep the
++  // same-origin localStorage messaging (E5); content-script worlds get stubs
++  // (browser-routed messaging arrives in W1c) so they don't touch the page's
++  // localStorage.
+   void InstallChromeApi(v8::Local<v8::Context> context,
+-                        const std::string& extension_id);
++                        const std::string& extension_id,
++                        bool is_content_script);
+ 
+   // gin-bound native functions backing `chrome.storage.local`. Each issues an
+   // async Mojo request to the browser-side ExtensionApi and returns a JS Promise
+@@ -78,6 +86,10 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   // Per-frame transport for the browser-backed `chrome.*` APIs (Wield W1a).
+   mojo::Remote<mojom::ExtensionApi> extension_api_;
+   std::vector<mojom::ContentScriptPtr> content_scripts_;
++  // Maps a content-script isolated world id to the extension that owns it, so
++  // DidCreateScriptContext can install that extension's `chrome.*` into the
++  // world (Wield W1b). Rebuilt whenever content scripts arrive.
++  std::map<int32_t, std::string> world_to_extension_;
+   bool scripts_loaded_ = false;
+   // Bitmask of ContentScriptRunAt stages already reached for the current
+   // document (reset on each commit), so scripts arriving late still inject for

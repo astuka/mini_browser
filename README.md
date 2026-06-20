@@ -116,9 +116,12 @@ Run it:
   (popup, options, background) and surviving restarts, via a new `chrome.*` transport — a per-frame
   `ExtensionApi` Mojo interface implemented in the browser plus **gin native bindings** in the renderer
   (the v8↔browser binding deferred in Part 1) — that replaces the old per-origin `localStorage` shim.
-  Next: the same native `chrome.*` inside content-script isolated worlds + browser-routed
-  `chrome.runtime` messaging across contexts (W1b), then `chrome.tabs`/`chrome.scripting` and the
-  `obsidian://` hand-off toward the clip.
+  **W1b — `chrome.*` in content scripts:** that same native `chrome.*` (and the shared
+  `chrome.storage.local`) is now installed into **content scripts' isolated worlds** too, so a content
+  script running on any web page reads/writes the same browser-backed store as the extension's
+  background/popup (verified: a content script on example.com reads the background's value and writes
+  back). Next: browser-routed `chrome.runtime` messaging across contexts (W1c), then
+  `chrome.tabs`/`chrome.scripting` and the `obsidian://` hand-off toward the clip.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

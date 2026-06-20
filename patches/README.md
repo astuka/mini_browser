@@ -359,6 +359,27 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   background's next launch) — proving it's genuinely browser-backed, not localStorage. **Scope:**
   extension *pages* only (main world); installing the native `chrome.*` into content-script isolated
   worlds, plus browser-routed `chrome.runtime` messaging across contexts, is **W1b** (next).
+- **`0030-chrome-api-in-content-scripts.patch`** — **`chrome.*` (incl. browser-backed
+  `chrome.storage.local`) inside content scripts** (Wield epic, **W1b**). W1a wired the native
+  `chrome.*` only into extension *pages*' main world; content scripts (which run in isolated worlds on
+  arbitrary web pages) still got nothing. This adds an `extension_id` field to the `ContentScript`
+  mojom struct (set by the browser from the owning extension), so the renderer builds a
+  `world_id → extension_id` map when content scripts arrive; `DidCreateScriptContext` then installs that
+  extension's `chrome.*` into the isolated world when it's created (reusing W1a's `InstallChromeApi` +
+  gin storage bindings). `chrome.runtime` messaging is gated by a `messaging_enabled` flag baked into
+  the shim: extension pages keep the same-origin localStorage messaging (E5), while content-script
+  worlds get **no-op messaging stubs** (the page's localStorage is the wrong origin) until
+  browser-routed messaging lands in **W1c** — listeners are still accepted so extensions that register
+  handlers load cleanly. Touches `shell_extension_scripts.mojom`, `shell_extension_scripts_impl.cc`,
+  `shell_render_frame_observer.{cc,h}`; stacks on `0029`. **Verified** with a content-script test
+  extension on a normal web page (example.com): the content script's `chrome.runtime.id` resolves, and
+  `chrome.storage.local.get` **reads the value the background wrote** (shown in an on-page banner:
+  `count=1, lastWriter=background`) and **writes back** to the same store (`contentScriptSaw`,
+  `lastWriter:"content_script"` confirmed in Local State, keyed under the extension's id and isolated
+  from other extensions' stores). So a content script now shares one browser-backed `chrome.storage`
+  with the extension's background/popup/options. **Next (W1c):** browser-routed `chrome.runtime`
+  messaging across all contexts (the `ExtensionApiClient` browser→renderer push + a per-extension
+  context registry).
 
 ## Workflow
 
