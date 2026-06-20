@@ -125,8 +125,11 @@ Run it:
   origins), via an `ExtensionApiClient` push channel + a per-extension context registry, with the
   `chrome.*` runtime refactored to one bindings object per v8 context (verified: a content script
   messages the background, and a popup broadcast lands in the content script's `onMessage`). This
-  completes the **W1 keystone** (storage + content-script `chrome.*` + cross-context messaging). Next:
-  `chrome.tabs`/`chrome.scripting` and the `obsidian://` hand-off toward the clip.
+  completes the **W1 keystone** (storage + content-script `chrome.*` + cross-context messaging).
+  **W2 — `chrome.tabs`:** a popup/background can now `query`/`get`/`create`/`update` tabs (e.g.
+  `tabs.query({active:true})` to find the active tab), backed by a TabNode↔tabId bridge into the tab
+  strip (verified: query active/all, create + activate, and navigate the active tab). Next:
+  `chrome.scripting.executeScript`/`activeTab` (W3) and the `obsidian://` hand-off toward the clip.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

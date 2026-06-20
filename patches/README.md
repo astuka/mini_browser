@@ -405,6 +405,24 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   origins, excluding the sender. **W1 (the `chrome.*` transport keystone) is now complete:** storage +
   content-script `chrome.*` + cross-context runtime messaging. (`sendResponse`/response routing is not
   yet implemented; that and `chrome.tabs`/`scripting` come next.)
+- **`0032-chrome-tabs.patch`** — **`chrome.tabs` core subset** (Wield epic, **W2**), backed by a
+  TabNode↔tabId bridge into the tabbed UI. The mac `TabbedShellController` gains a stable per-tab `tabId`
+  (assigned in `addTabForShell`) and C++ bridge functions (`ShellGetTabs`/`ShellCreateTab`/
+  `ShellUpdateTab`, declared in new `shell_extension_tabs.h`) that walk the tab tree, report the active
+  tab, and create/navigate/activate tabs. `ExtensionApi` gains `TabsQuery`/`TabsGet`/`TabsCreate`/
+  `TabsUpdate` (JSON request/reply); `ShellExtensionApiImpl` answers them (IS_MAC-guarded), serializing
+  tabs as `{id,url,title,active,windowId,index}`. The renderer adds `chrome.tabs.{query,get,create,
+  update}` to the shim (with the `update(props)` / `update(tabId,props)` overloads) backed by new gin
+  functions. So an extension popup/background can enumerate tabs, find the active one, open tabs, and
+  navigate them. Touches `shell_extension_api.mojom`, `shell_extension_api_impl.{cc,h}`,
+  `shell_extension_context_bindings.{cc,h}`, `shell_platform_delegate_mac.mm`,
+  `content/shell/BUILD.gn`, and adds `shell_extension_tabs.h`; stacks on `0031`. **Verified** with a
+  tabs test extension: `tabs.query({active:true})` reports the active tab, `tabs.query({})` returns the
+  full tab array with well-formed objects, `tabs.create({url})` opens + activates a new tab and returns
+  it, and `tabs.update({url})` navigates the active tab (URL bar followed to example.org). This gives W3
+  (`chrome.scripting.executeScript`) the active-tab id it targets. **Next (W3):** `chrome.scripting`/
+  `activeTab` to run code in a tab and read its content (plus `sendResponse` so request/reply messaging
+  works), toward the Obsidian clip.
 
 ## Workflow
 
