@@ -81,8 +81,9 @@ Run it:
   third-party-cookie blocking); download safety (dangerous file-type warnings); and a
   Security Diagnostics panel (⌘⇧D — process model, sandbox status, site isolation, per-tab
   renderer PIDs).
-- 🧩 **Extension epic ("Graft") — in progress:** an extension runtime built directly on
-  content_shell, from scratch (no `//chrome/browser/extensions`). So far: an **extension model +
+- 🧩 **Extension epic, Part 1 ("Graft") — complete (loading + install):** an extension runtime built
+  directly on content_shell, from scratch (no `//chrome/browser/extensions`). It delivers an
+  **extension model +
   unpacked loader + manager** (⌘⇧E) — load an unpacked extension folder, parse its MV3
   `manifest.json`, derive a Chrome-style id from the path, and list/enable/disable/remove it from a
   management window, persisted across restarts; the **`chrome-extension://` scheme + a
@@ -107,7 +108,17 @@ Run it:
   Web Clipper). **Boundary:** install + page-loading work for real Web Store extensions, but full
   *functionality* of a complex extension needs a much larger `chrome.*` API surface than this runtime
   implements yet (e.g. `chrome.tabs`/`scripting`, `chrome.*` in content scripts, external protocols) —
-  a future epic.
+  the focus of Part 2.
+- 🛠️ **Extension epic, Part 2 ("Wield") — in progress:** making installed extensions actually
+  *usable*, not just loadable, with the real Obsidian Web Clipper (clip a page to an Obsidian vault) as
+  the end-to-end bar. **W1a — browser-backed `chrome.storage.local`:** an extension's data now lives in
+  one browser-persisted store (`content_shell.extension_storage`) **shared across all of its contexts**
+  (popup, options, background) and surviving restarts, via a new `chrome.*` transport — a per-frame
+  `ExtensionApi` Mojo interface implemented in the browser plus **gin native bindings** in the renderer
+  (the v8↔browser binding deferred in Part 1) — that replaces the old per-origin `localStorage` shim.
+  Next: the same native `chrome.*` inside content-script isolated worlds + browser-routed
+  `chrome.runtime` messaging across contexts (W1b), then `chrome.tabs`/`chrome.scripting` and the
+  `obsidian://` hand-off toward the clip.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

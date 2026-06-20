@@ -337,6 +337,28 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (its `browser-polyfill` content script), `contextMenus`/`sidePanel`/`commands`, and the `obsidian://`
   external-protocol hand-off. Full real-extension *functionality* is a much larger `chrome.*` surface
   than E1–E9 (a future epic); install + page-loading is what E9 proves.
+- **`0029-chrome-storage-browser-backed.patch`** — **browser-backed `chrome.storage.local`** (Wield
+  epic, **W1a** — the first step toward making installed extensions actually *usable*, not just
+  loadable). Replaces E5's per-origin `localStorage` shim with a real transport: a new per-frame Mojo
+  interface `content.mojom.ExtensionApi` (`StorageGet`/`StorageSet`/`StorageRemove`/`StorageClear`,
+  JSON payloads keyed by extension id) implemented browser-side by `ShellExtensionApiImpl`, backed by
+  a new `content_shell.extension_storage` pref (a dict keyed by extension id) with
+  `Get/SetExtensionStorageDict` accessors. Renderer-side, `chrome.storage.local` is now backed by
+  **gin native functions** (the v8↔browser binding deliberately deferred in E5) installed into each
+  extension page's main world: they issue the async Mojo request and resolve a JS `Promise` (wrapped
+  in a `v8::MicrotasksScope`, which Blink's scoped-microtask policy requires). So an extension's data
+  now lives in **one browser-persisted store shared across all its contexts** (popup, options,
+  background) instead of separate per-origin localStorage. Also adds `chrome.storage.sync` (aliased to
+  local), a `chrome.storage.onChanged` listener, and the legacy `get(callback)` form. Touches
+  `content/shell/BUILD.gn` (new mojom + impl sources, `//gin` dep),
+  `shell_content_browser_client.{cc,h}`, `shell_render_frame_observer.{cc,h}`, and adds
+  `shell_extension_api.mojom` + `shell_extension_api_impl.{cc,h}`; stacks on `0028`. **Verified** with
+  a two-context test extension: the background context writes `chrome.storage.local`, the popup context
+  reads back the same values, a write from the popup merges into the same store, and the data persists
+  across a restart in Local State under `content_shell.extension_storage` (count incremented 1→2 on the
+  background's next launch) — proving it's genuinely browser-backed, not localStorage. **Scope:**
+  extension *pages* only (main world); installing the native `chrome.*` into content-script isolated
+  worlds, plus browser-routed `chrome.runtime` messaging across contexts, is **W1b** (next).
 
 ## Workflow
 
