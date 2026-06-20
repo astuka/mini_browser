@@ -290,6 +290,22 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   (hosting); stacks on `0020`/`0021`/`0024`. Reduced-model caveats: it's a persistent page, not a real
   ephemeral SW (no `onInstalled`/SW-only events; runs while the browser is open), and cross-context
   messaging is same-origin-only (extension pages, not content scripts).
+- **`0026-declarative-net-request.patch`** — **`declarativeNetRequest` block rules** (E7), the
+  ad/content-blocker milestone. Enabled extensions' static DNR rules now block network requests
+  (subresources included), so a real ad-blocker runs. `ReloadExtensionNetRules` (on the
+  `ShellContentBrowserClient`) compiles a flat list of `block`-rule `urlFilter`s from each enabled
+  extension's manifest `declarative_net_request.rule_resources` + their JSON rule files (UI thread,
+  on startup and every manager change). Enforcement is a **proxying `URLLoaderFactory`** inserted via
+  `WillCreateURLLoaderFactory` (`network::URLLoaderFactoryBuilder::Append`) — a `DNRProxyFactory`
+  (subclass of `0021`'s `SelfDeletingURLLoaderFactory`) that cancels matching requests with
+  `ERR_BLOCKED_BY_CLIENT` and forwards the rest to the real factory. This catches **subresources**
+  (the actual ads), unlike a browser-side `URLLoaderThrottle` which only sees navigations. The
+  `urlFilter` matcher (`MatchesUrlFilter`) is a pragmatic subset: `*` wildcards, `^` as a wildcard
+  separator, `|`/`||` anchors stripped (domain anchors approximated as ordered substrings),
+  case-insensitive. Touches `shell_content_browser_client.{cc,h}` (rules + proxy + hook) and
+  `shell_platform_delegate_mac.mm` (calls `ReloadExtensionNetRules` at startup + on changes); stacks
+  on `0020`/`0021`. Note: this is the same request-interception seam the Security epic's S5 blocklist
+  would use; supports `block` rules only for now (no `redirect`/`modifyHeaders`).
 
 ## Workflow
 

@@ -1,0 +1,347 @@
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 5339b577ca..dcad4f98b8 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -21,18 +21,28 @@
+ #include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
+ #include "base/files/file.h"
++#include "base/files/file_util.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/threading/thread_restrictions.h"
+ #include "base/threading/sequence_local_storage_slot.h"
+ #include "base/values.h"
+ #include "base/containers/flat_set.h"
+ #include "base/functional/bind.h"
++#include "net/base/net_errors.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/self_deleting_url_loader_factory.h"
++#include "services/network/public/cpp/url_loader_completion_status.h"
++#include "services/network/public/cpp/url_loader_factory_builder.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
+ #include "ui/base/page_transition_types.h"
+@@ -342,6 +352,105 @@ bool AreIsolatedWebAppsEnabled() {
+   return base::FeatureList::IsEnabled(features::kIsolatedWebApps);
+ }
+ 
++// --- declarativeNetRequest (Graft epic, E7) -------------------------------
++//
++// Block-rule URL filters compiled from enabled extensions' static DNR rule
++// resources. Mutated and read only on the UI thread (in ReloadExtensionNetRules
++// and CreateURLLoaderThrottles); each throttle gets its own immutable copy, so
++// matching on the loader sequence is race-free.
++std::vector<std::string>& ExtensionNetRules() {
++  static base::NoDestructor<std::vector<std::string>> rules;
++  return *rules;
++}
++
++// Matches a DNR `urlFilter` against a URL. Implements a pragmatic subset: `*`
++// wildcards, `^` treated as a wildcard separator, and `|`/`||` anchors stripped
++// (domain-anchored rules are approximated as ordered substrings). Case-
++// insensitive, matching Chrome's default.
++bool MatchesUrlFilter(std::string filter, std::string url) {
++  filter = base::ToLowerASCII(filter);
++  url = base::ToLowerASCII(url);
++  if (filter.starts_with("||")) {
++    filter = filter.substr(2);
++  } else if (filter.starts_with("|")) {
++    filter = filter.substr(1);
++  }
++  if (filter.ends_with("|")) {
++    filter.pop_back();
++  }
++  base::ReplaceChars(filter, "^", "*", &filter);
++
++  // Each non-empty segment between '*' must appear in order in the URL.
++  size_t pos = 0;
++  for (std::string_view segment : base::SplitStringPiece(
++           filter, "*", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (segment.empty()) {
++      continue;
++    }
++    size_t found = url.find(segment, pos);
++    if (found == std::string::npos) {
++      return false;
++    }
++    pos = found + segment.size();
++  }
++  return true;
++}
++
++// A proxying URLLoaderFactory inserted (via WillCreateURLLoaderFactory) in front
++// of the real factory the renderer uses. It cancels requests matching any
++// enabled extension's DNR block rule — the core of an ad/content blocker — and
++// forwards everything else to the target factory. Unlike a browser-side
++// URLLoaderThrottle (navigation-only), this catches subresource requests too.
++class DNRProxyFactory : public network::SelfDeletingURLLoaderFactory {
++ public:
++  static void CreateAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoaderFactory> receiver,
++      mojo::PendingRemote<network::mojom::URLLoaderFactory> target,
++      std::vector<std::string> filters) {
++    // Owns its own lifetime (self-deletes when all receivers disconnect).
++    new DNRProxyFactory(std::move(receiver), std::move(target),
++                        std::move(filters));
++  }
++
++  DNRProxyFactory(const DNRProxyFactory&) = delete;
++  DNRProxyFactory& operator=(const DNRProxyFactory&) = delete;
++
++  void CreateLoaderAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      override {
++    std::string url = request.url.spec();
++    for (const std::string& filter : filters_) {
++      if (MatchesUrlFilter(filter, url)) {
++        mojo::Remote<network::mojom::URLLoaderClient> client_remote(
++            std::move(client));
++        client_remote->OnComplete(
++            network::URLLoaderCompletionStatus(net::ERR_BLOCKED_BY_CLIENT));
++        return;
++      }
++    }
++    target_->CreateLoaderAndStart(std::move(loader), request_id, options,
++                                  request, std::move(client),
++                                  traffic_annotation);
++  }
++
++ private:
++  DNRProxyFactory(
++      mojo::PendingReceiver<network::mojom::URLLoaderFactory> receiver,
++      mojo::PendingRemote<network::mojom::URLLoaderFactory> target,
++      std::vector<std::string> filters)
++      : network::SelfDeletingURLLoaderFactory(std::move(receiver)),
++        target_(std::move(target)),
++        filters_(std::move(filters)) {}
++
++  mojo::Remote<network::mojom::URLLoaderFactory> target_;
++  std::vector<std::string> filters_;
++};
++
+ }  // namespace
+ 
+ std::string GetShellLanguage() {
+@@ -421,6 +530,33 @@ ShellContentBrowserClient::CreateURLLoaderThrottles(
+   return result;
+ }
+ 
++void ShellContentBrowserClient::WillCreateURLLoaderFactory(
++    BrowserContext* browser_context,
++    RenderFrameHost* frame,
++    int render_process_id,
++    URLLoaderFactoryType type,
++    const url::Origin& request_initiator,
++    const net::IsolationInfo& isolation_info,
++    std::optional<int64_t> navigation_id,
++    ukm::SourceIdObj ukm_source_id,
++    network::URLLoaderFactoryBuilder& factory_builder,
++    mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>*
++        header_client,
++    bool* bypass_redirect_checks,
++    bool* disable_secure_dns,
++    network::mojom::URLLoaderFactoryOverridePtr* factory_override,
++    scoped_refptr<base::SequencedTaskRunner> navigation_response_task_runner) {
++  // Insert the declarativeNetRequest blocking proxy (Graft E7) in front of the
++  // real factory so it sees subresource requests too. Skipped entirely when no
++  // extension declares block rules.
++  if (ExtensionNetRules().empty()) {
++    return;
++  }
++  auto [receiver, remote] = factory_builder.Append();
++  DNRProxyFactory::CreateAndStart(std::move(receiver), std::move(remote),
++                                  ExtensionNetRules());
++}
++
+ bool ShellContentBrowserClient::IsHandledURL(const GURL& url) {
+   if (!url.is_valid()) {
+     return false;
+@@ -536,6 +672,91 @@ void ShellContentBrowserClient::SetExtensions(base::DictValue extensions) {
+   GetSharedState().local_state->CommitPendingWrite();
+ }
+ 
++void ShellContentBrowserClient::ReloadExtensionNetRules() {
++  // Recompiles the declarativeNetRequest block filters from enabled extensions'
++  // static rule resources. UI thread; small, infrequent (startup + on extension
++  // change), so the file reads are done synchronously.
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  std::vector<std::string> filters;
++
++  base::DictValue extensions = GetExtensions();
++  for (auto&& [id, value] : extensions) {
++    if (!value.is_dict()) {
++      continue;
++    }
++    const base::DictValue& entry = value.GetDict();
++    if (!entry.FindBool("enabled").value_or(true)) {
++      continue;
++    }
++    const std::string* path = entry.FindString("path");
++    if (!path) {
++      continue;
++    }
++    base::FilePath root = base::FilePath::FromUTF8Unsafe(*path);
++
++    std::string manifest_text;
++    if (!base::ReadFileToString(root.Append("manifest.json"), &manifest_text)) {
++      continue;
++    }
++    std::optional<base::Value> manifest = base::JSONReader::Read(
++        manifest_text, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++    if (!manifest || !manifest->is_dict()) {
++      continue;
++    }
++    const base::DictValue* dnr =
++        manifest->GetDict().FindDict("declarative_net_request");
++    const base::ListValue* resources =
++        dnr ? dnr->FindList("rule_resources") : nullptr;
++    if (!resources) {
++      continue;
++    }
++
++    for (const base::Value& resource : *resources) {
++      if (!resource.is_dict()) {
++        continue;
++      }
++      const base::DictValue& res = resource.GetDict();
++      if (!res.FindBool("enabled").value_or(true)) {
++        continue;
++      }
++      const std::string* rule_path = res.FindString("path");
++      if (!rule_path) {
++        continue;
++      }
++      std::string rules_text;
++      if (!base::ReadFileToString(
++              root.Append(base::FilePath::FromUTF8Unsafe(*rule_path)),
++              &rules_text)) {
++        continue;
++      }
++      std::optional<base::Value> rules = base::JSONReader::Read(
++          rules_text, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++      if (!rules || !rules->is_list()) {
++        continue;
++      }
++      for (const base::Value& rule : rules->GetList()) {
++        if (!rule.is_dict()) {
++          continue;
++        }
++        const base::DictValue& r = rule.GetDict();
++        const base::DictValue* action = r.FindDict("action");
++        const std::string* type = action ? action->FindString("type") : nullptr;
++        if (!type || *type != "block") {
++          continue;  // E7 supports `block` rules only.
++        }
++        const base::DictValue* condition = r.FindDict("condition");
++        const std::string* url_filter =
++            condition ? condition->FindString("urlFilter") : nullptr;
++        if (url_filter && !url_filter->empty()) {
++          filters.push_back(*url_filter);
++        }
++      }
++    }
++  }
++
++  ExtensionNetRules() = std::move(filters);
++}
++
+ std::optional<bool> ShellContentBrowserClient::GetSitePermission(
+     const std::string& origin,
+     const std::string& key) {
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index 3c634225ac..e9cc83d6a6 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -58,6 +58,23 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+       NavigationUIData* navigation_ui_data,
+       FrameTreeNodeId frame_tree_node_id,
+       std::optional<int64_t> navigation_id) override;
++  void WillCreateURLLoaderFactory(
++      BrowserContext* browser_context,
++      RenderFrameHost* frame,
++      int render_process_id,
++      URLLoaderFactoryType type,
++      const url::Origin& request_initiator,
++      const net::IsolationInfo& isolation_info,
++      std::optional<int64_t> navigation_id,
++      ukm::SourceIdObj ukm_source_id,
++      network::URLLoaderFactoryBuilder& factory_builder,
++      mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>*
++          header_client,
++      bool* bypass_redirect_checks,
++      bool* disable_secure_dns,
++      network::mojom::URLLoaderFactoryOverridePtr* factory_override,
++      scoped_refptr<base::SequencedTaskRunner> navigation_response_task_runner)
++      override;
+   bool AreIsolatedWebAppsEnabled(BrowserContext* browser_context) override;
+   void AppendExtraCommandLineSwitches(base::CommandLine* command_line,
+                                       int child_process_id) override;
+@@ -257,6 +274,11 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+   base::DictValue GetExtensions();
+   void SetExtensions(base::DictValue extensions);
+ 
++  // Recompiles enabled extensions' declarativeNetRequest block rules into the
++  // filter list consulted by the request-blocking throttle. Call on the UI
++  // thread at startup and whenever the installed/enabled set changes.
++  void ReloadExtensionNetRules();
++
+  protected:
+   // Call this if CreateBrowserMainParts() is overridden in a subclass.
+   void set_browser_main_parts(ShellBrowserMainParts* parts);
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index a0a53ce325..a9b01ee6af 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -894,10 +894,12 @@ - (void)attachContentsForShell:(content::Shell*)shell {
+   else
+     shell->web_contents()->WasHidden();
+ 
+-  // Launch extension background pages once a browser context is available.
++  // Launch extension background pages + load network rules once a browser
++  // context is available.
+   if (!_backgroundStarted) {
+     _backgroundStarted = YES;
+     [self rebuildBackgroundPages];
++    content::ShellContentBrowserClient::Get()->ReloadExtensionNetRules();
+   }
+ }
+ 
+@@ -1777,6 +1779,7 @@ - (void)installExtensionFromDirectory:(NSString*)dir {
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
+   [self rebuildBackgroundPages];
++  content::ShellContentBrowserClient::Get()->ReloadExtensionNetRules();
+ }
+ 
+ - (void)loadUnpackedExtension:(id)sender {
+@@ -1814,6 +1817,7 @@ - (void)toggleExtensionEnabled:(NSButton*)sender {
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
+   [self rebuildBackgroundPages];
++  content::ShellContentBrowserClient::Get()->ReloadExtensionNetRules();
+ }
+ 
+ - (void)removeExtension:(NSButton*)sender {
+@@ -1828,6 +1832,7 @@ - (void)removeExtension:(NSButton*)sender {
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
+   [self rebuildBackgroundPages];
++  content::ShellContentBrowserClient::Get()->ReloadExtensionNetRules();
+ }
+ 
+ // A non-editable, borderless label used in the extensions list.
