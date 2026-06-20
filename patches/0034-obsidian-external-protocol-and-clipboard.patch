@@ -1,0 +1,150 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 5e89a1a385..c45d60aba1 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -207,6 +207,7 @@ static_library("content_shell_lib") {
+     "browser/shell_extension_tabs.h",
+     "browser/shell_extension_url_loader_factory.cc",
+     "browser/shell_extension_url_loader_factory.h",
++    "browser/shell_external_protocol.h",
+     "browser/shell_javascript_dialog.h",
+     "browser/shell_javascript_dialog_manager.cc",
+     "browser/shell_javascript_dialog_manager.h",
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index d013b8a311..ff64c9abe8 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -91,6 +91,7 @@
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
+ #include "content/shell/browser/shell_extension_api_impl.h"
++#include "content/shell/browser/shell_external_protocol.h"
+ #include "content/shell/browser/shell_extension_scripts_impl.h"
+ #include "content/shell/browser/shell_extension_url_loader_factory.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+@@ -912,6 +913,14 @@ void ShellContentBrowserClient::OverrideWebPreferences(
+     prefs->preferred_contrast = blink::mojom::PreferredContrast::kNoPreference;
+   }
+ 
++  // Let page JS use the clipboard via execCommand('copy'/'cut'/'paste') without a
++  // user gesture. Extensions like the Obsidian Web Clipper hand their built note
++  // to Obsidian through the system clipboard (a content script copies it, then
++  // opens obsidian://new?...&clipboard), which otherwise silently no-ops in
++  // content_shell (Wield W4).
++  prefs->javascript_can_access_clipboard = true;
++  prefs->dom_paste_enabled = true;
++
+   // Per-site JavaScript toggle from the SiteSettings store (S7). Absent = on.
+   if (web_contents && web_contents->GetPrimaryMainFrame()) {
+     std::string origin =
+@@ -1256,6 +1265,30 @@ void ShellContentBrowserClient::AllowCertificateError(
+   std::move(callback).Run(CERTIFICATE_REQUEST_RESULT_TYPE_CANCEL);
+ }
+ 
++bool ShellContentBrowserClient::HandleExternalProtocol(
++    const GURL& url,
++    base::RepeatingCallback<WebContents*()> web_contents_getter,
++    FrameTreeNodeId frame_tree_node_id,
++    NavigationUIData* navigation_data,
++    bool is_primary_main_frame,
++    bool is_in_fenced_frame_tree,
++    network::mojom::WebSandboxFlags sandbox_flags,
++    ui::PageTransition page_transition,
++    bool has_user_gesture,
++    const std::optional<url::Origin>& initiating_origin,
++    RenderFrameHost* initiator_document,
++    const net::IsolationInfo& isolation_info,
++    mojo::PendingRemote<network::mojom::URLLoaderFactory>* out_factory) {
++  // A navigation targeted a scheme content_shell can't load (e.g. obsidian://,
++  // mailto:). Hand it to the OS's registered handler app (Wield W4). Returning
++  // true cancels the in-page navigation (out_factory left unset).
++#if BUILDFLAG(IS_MAC)
++  return ShellLaunchExternalURL(url);
++#else
++  return false;
++#endif
++}
++
+ base::DictValue ShellContentBrowserClient::GetNetLogConstants() {
+   base::DictValue client_constants;
+   client_constants.Set("name", "content_shell");
+diff --git a/content/shell/browser/shell_content_browser_client.h b/content/shell/browser/shell_content_browser_client.h
+index d2a51b7a37..ed73d2f340 100644
+--- a/content/shell/browser/shell_content_browser_client.h
++++ b/content/shell/browser/shell_content_browser_client.h
+@@ -159,6 +159,21 @@ class ShellContentBrowserClient : public ContentBrowserClient {
+       bool is_primary_main_frame_request,
+       bool strict_enforcement,
+       base::OnceCallback<void(CertificateRequestResultType)> callback) override;
++  bool HandleExternalProtocol(
++      const GURL& url,
++      base::RepeatingCallback<WebContents*()> web_contents_getter,
++      FrameTreeNodeId frame_tree_node_id,
++      NavigationUIData* navigation_data,
++      bool is_primary_main_frame,
++      bool is_in_fenced_frame_tree,
++      network::mojom::WebSandboxFlags sandbox_flags,
++      ui::PageTransition page_transition,
++      bool has_user_gesture,
++      const std::optional<url::Origin>& initiating_origin,
++      RenderFrameHost* initiator_document,
++      const net::IsolationInfo& isolation_info,
++      mojo::PendingRemote<network::mojom::URLLoaderFactory>* out_factory)
++      override;
+   base::DictValue GetNetLogConstants() override;
+   base::FilePath GetSandboxedStorageServiceDataDirectory() override;
+   base::FilePath GetFirstPartySetsDirectory() override;
+diff --git a/content/shell/browser/shell_external_protocol.h b/content/shell/browser/shell_external_protocol.h
+new file mode 100644
+index 0000000000..90e9f72aae
+--- /dev/null
++++ b/content/shell/browser/shell_external_protocol.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_BROWSER_SHELL_EXTERNAL_PROTOCOL_H_
++#define CONTENT_SHELL_BROWSER_SHELL_EXTERNAL_PROTOCOL_H_
++
++class GURL;
++
++namespace content {
++
++// Hands `url` (a non-web external scheme such as obsidian:// or mailto:) to the
++// operating system to open in the registered handler app (Wield epic, W4).
++// Returns true if the launch was attempted. Implemented in the platform
++// delegate (mac: NSWorkspace).
++bool ShellLaunchExternalURL(const GURL& url);
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_BROWSER_SHELL_EXTERNAL_PROTOCOL_H_
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index bff88c1abe..ae9ab53b1d 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -55,6 +55,7 @@
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_extension_tabs.h"
++#include "content/shell/browser/shell_external_protocol.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
+ #include "components/crx_file/crx_verifier.h"
+ #include "crypto/sha2.h"
+@@ -3482,6 +3483,15 @@ bool ShellUpdateTab(int tab_id, const std::string& url, bool make_active) {
+   return [g_tab_controller extensionWebContentsForTab:tab_id];
+ }
+ 
++bool ShellLaunchExternalURL(const GURL& url) {
++  NSURL* ns_url = [NSURL URLWithString:base::SysUTF8ToNSString(url.spec())];
++  if (!ns_url) {
++    return false;
++  }
++  [[NSWorkspace sharedWorkspace] openURL:ns_url];
++  return true;
++}
++
+ // These are required by the header (it declares the members), but the tab
+ // controller above holds all real state, so they stay empty.
+ struct ShellPlatformDelegate::ShellData {};

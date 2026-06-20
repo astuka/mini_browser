@@ -133,8 +133,14 @@ Run it:
   result back — the page-extraction mechanism the Obsidian Clipper uses. The browser routes to the
   target tab's renderer (via a per-frame `ExtensionScriptRunner`), runs the code in the extension's
   isolated world, and returns the JSON-serialized result as chrome's `[{frameId, result}]` (verified: a
-  popup extracted `{title, url, h1, textLength}` live from the active page). Next: the `obsidian://`
-  external-protocol hand-off (W4) → an actual end-to-end clip attempt.
+  popup extracted `{title, url, h1, textLength}` live from the active page). **W4 — the clip works:** with
+  `obsidian://` external-protocol launch (handed to the OS via `NSWorkspace`), page-JS clipboard access,
+  request/response `chrome.runtime`/`chrome.tabs` messaging, `chrome.i18n`, and the remaining MV3 API
+  stubs, the **real Web-Store-installed Obsidian Web Clipper clips a live page end-to-end** — its popup
+  extracts the page to markdown and "Add to Obsidian" writes a real note (YAML frontmatter + body) to the
+  vault's `Clippings/` folder. **This is the Wield epic's north star, achieved.** (Other complex
+  extensions get progressively more of what they need; some surfaces — ports, sidePanel UI,
+  contextMenus/commands actions — remain stubbed.)
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.
