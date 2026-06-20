@@ -259,6 +259,20 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   stacks on the full `.mm` chain and on `0020`/`0021` (store + chrome-extension:// serving). A popup
   with no `default_popup` is a no-op for now (it would fire `chrome.action.onClicked`, which needs the
   `chrome.*` API bridge in E5).
+- **`0024-chrome-api-bridge.patch`** — a **`chrome.*` API shim** injected into extension pages (E5).
+  `ShellRenderFrameObserver::DidCreateScriptContext` detects an extension page's main world (a
+  `chrome-extension://` document, `world_id == 0`) and compiles + runs a small JS shim in that v8
+  context (before the page's own scripts), giving extension pages a `chrome` object:
+  **`chrome.runtime`** (`id`, `getURL(path)`, and `sendMessage`/`onMessage` delivered across
+  same-origin extension contexts via a `localStorage` mailbox + the cross-document `storage` event);
+  **`chrome.storage.local`** (`get`/`set`/`remove`/`clear`, callback + Promise styles), backed by the
+  extension origin's `localStorage` so values persist per-extension with no browser plumbing; and
+  minimal **`chrome.action`** stubs. The shim is pure JS (the extension id is substituted in), so
+  there's no native/Mojo transport yet. Touches only
+  `content/shell/renderer/shell_render_frame_observer.{cc,h}`; stacks on the full chain and on `0020`/
+  `0021` (extension store + `chrome-extension://` origin). Scope note: this covers **extension pages**;
+  giving content scripts (which run in an isolated world at the *page's* origin) the same APIs needs a
+  browser-backed transport, which arrives with a later PR (alongside the background worker).
 
 ## Workflow
 

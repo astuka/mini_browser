@@ -1,0 +1,205 @@
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index e9a19cb18f..b892132ffd 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/functional/bind.h"
++#include "base/strings/string_util.h"
+ #include "content/public/renderer/render_frame.h"
+ #include "content/public/renderer/render_frame_observer.h"
+ #include "content/shell/common/render_frame_test_helper.mojom.h"
+@@ -21,6 +22,7 @@
+ #include "third_party/blink/public/web/web_script_source.h"
+ #include "third_party/blink/public/web/web_testing_support.h"
+ #include "url/gurl.h"
++#include "v8/include/v8.h"
+ 
+ namespace content {
+ 
+@@ -117,6 +119,122 @@ bool ScriptMatchesUrl(const mojom::ContentScript& script, const GURL& url) {
+   return false;
+ }
+ 
++// The `chrome.*` API shim injected into an extension page's main world (E5).
++// Pure JS: runtime.id/getURL are trivial; storage.local is backed by the
++// extension origin's localStorage (so it persists per-extension with no browser
++// plumbing); runtime messaging is delivered between same-origin extension
++// contexts via the localStorage `storage` event. `__EXTENSION_ID__` is replaced
++// with the real id before injection.
++std::string BuildChromeShim(const std::string& extension_id) {
++  static const char kShim[] = R"JS(
++(function() {
++  if (window.chrome && window.chrome.runtime && window.chrome.runtime.id) {
++    return;
++  }
++  var EXT_ID = "__EXTENSION_ID__";
++  var NS = "__shellext_" + EXT_ID;
++  function readAll() {
++    try { return JSON.parse(localStorage.getItem(NS) || "{}"); }
++    catch (e) { return {}; }
++  }
++  function writeAll(o) {
++    try { localStorage.setItem(NS, JSON.stringify(o)); } catch (e) {}
++  }
++  var chrome = window.chrome || {};
++
++  chrome.runtime = chrome.runtime || {};
++  chrome.runtime.id = EXT_ID;
++  chrome.runtime.getURL = function(path) {
++    return "chrome-extension://" + EXT_ID + "/" +
++           String(path == null ? "" : path).replace(/^\//, "");
++  };
++
++  // Messaging across same-origin extension contexts (popup, options,
++  // background) via a localStorage mailbox + the cross-document storage event.
++  var listeners = [];
++  chrome.runtime.onMessage = {
++    addListener: function(fn) { if (typeof fn === "function") listeners.push(fn); },
++    removeListener: function(fn) {
++      var i = listeners.indexOf(fn);
++      if (i >= 0) listeners.splice(i, 1);
++    }
++  };
++  chrome.runtime.sendMessage = function(message, cb) {
++    var envelope = { from: EXT_ID, message: message,
++                     nonce: Date.now() + ":" + Math.random() };
++    try { localStorage.setItem(NS + "_mailbox", JSON.stringify(envelope)); }
++    catch (e) {}
++    if (typeof cb === "function") { setTimeout(function() { cb(); }, 0); }
++    return Promise.resolve();
++  };
++  window.addEventListener("storage", function(e) {
++    if (e.key !== NS + "_mailbox" || !e.newValue) return;
++    var env;
++    try { env = JSON.parse(e.newValue); } catch (_) { return; }
++    var sender = { id: EXT_ID };
++    listeners.slice().forEach(function(fn) {
++      try { fn(env.message, sender, function() {}); } catch (_) {}
++    });
++  });
++
++  chrome.storage = chrome.storage || {};
++  chrome.storage.local = {
++    get: function(keys, cb) {
++      var all = readAll(), result = {};
++      if (keys == null) {
++        result = all;
++      } else if (typeof keys === "string") {
++        if (keys in all) result[keys] = all[keys];
++      } else if (Array.isArray(keys)) {
++        keys.forEach(function(k) { if (k in all) result[k] = all[k]; });
++      } else if (typeof keys === "object") {
++        Object.keys(keys).forEach(function(k) {
++          result[k] = (k in all) ? all[k] : keys[k];
++        });
++      }
++      if (typeof cb === "function") { setTimeout(function() { cb(result); }, 0); }
++      return Promise.resolve(result);
++    },
++    set: function(items, cb) {
++      var all = readAll();
++      Object.keys(items || {}).forEach(function(k) { all[k] = items[k]; });
++      writeAll(all);
++      if (typeof cb === "function") { setTimeout(cb, 0); }
++      return Promise.resolve();
++    },
++    remove: function(keys, cb) {
++      var all = readAll();
++      (Array.isArray(keys) ? keys : [keys]).forEach(function(k) {
++        delete all[k];
++      });
++      writeAll(all);
++      if (typeof cb === "function") { setTimeout(cb, 0); }
++      return Promise.resolve();
++    },
++    clear: function(cb) {
++      writeAll({});
++      if (typeof cb === "function") { setTimeout(cb, 0); }
++      return Promise.resolve();
++    }
++  };
++
++  // Minimal chrome.action stubs (full support arrives with the browser-backed
++  // API bridge / background worker).
++  chrome.action = chrome.action || {
++    setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
++    setTitle: function(_d, cb) { if (typeof cb === "function") cb(); },
++    onClicked: { addListener: function() {} }
++  };
++
++  window.chrome = chrome;
++})();
++)JS";
++  std::string shim(kShim);
++  base::ReplaceSubstringsAfterOffset(&shim, 0, "__EXTENSION_ID__",
++                                     extension_id);
++  return shim;
++}
++
+ }  // namespace
+ 
+ ShellRenderFrameObserver::ShellRenderFrameObserver(RenderFrame* render_frame)
+@@ -223,4 +341,45 @@ void ShellRenderFrameObserver::InjectForRunAt(
+   }
+ }
+ 
++void ShellRenderFrameObserver::DidCreateScriptContext(
++    v8::Local<v8::Context> context,
++    int32_t world_id) {
++  // E5 installs the chrome.* shim only in extension pages' main world (popup,
++  // options, background). Content-script worlds get it once a browser-backed
++  // API bridge lands.
++  if (world_id != 0) {
++    return;
++  }
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (!frame) {
++    return;
++  }
++  GURL url = frame->GetDocument().Url();
++  if (!url.SchemeIs("chrome-extension") || url.host().empty()) {
++    return;
++  }
++
++  std::string shim = BuildChromeShim(std::string(url.host()));
++
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  v8::HandleScope handle_scope(isolate);
++  v8::Context::Scope context_scope(context);
++  v8::TryCatch try_catch(isolate);
++  v8::Local<v8::String> source;
++  if (!v8::String::NewFromUtf8(isolate, shim.c_str(),
++                               v8::NewStringType::kNormal, shim.size())
++           .ToLocal(&source)) {
++    return;
++  }
++  v8::Local<v8::Script> script;
++  if (!v8::Script::Compile(context, source).ToLocal(&script)) {
++    return;
++  }
++  v8::Local<v8::Value> result;
++  // Errors in the shim are non-fatal; just swallow them.
++  if (!script->Run(context).ToLocal(&result)) {
++    return;
++  }
++}
++
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index f18d479d9d..2fb6aa772c 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -35,6 +35,11 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void DidDispatchDOMContentLoadedEvent() override;
+   void DidFinishLoad() override;
+ 
++  // Injects the `chrome.*` API shim into extension pages' main world (Graft
++  // epic, E5).
++  void DidCreateScriptContext(v8::Local<v8::Context> context,
++                              int32_t world_id) override;
++
+   // Fetches the installed extensions' content scripts from the browser (once
+   // per frame) and caches them.
+   void RequestContentScripts();
