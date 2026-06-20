@@ -1,0 +1,1293 @@
+diff --git a/content/shell/BUILD.gn b/content/shell/BUILD.gn
+index 3530c7eaed..23b8b1e074 100644
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -239,6 +239,8 @@ static_library("content_shell_lib") {
+     "renderer/render_frame_test_helper.h",
+     "renderer/shell_content_renderer_client.cc",
+     "renderer/shell_content_renderer_client.h",
++    "renderer/shell_extension_context_bindings.cc",
++    "renderer/shell_extension_context_bindings.h",
+     "renderer/shell_render_frame_observer.cc",
+     "renderer/shell_render_frame_observer.h",
+     "utility/shell_content_utility_client.cc",
+diff --git a/content/shell/browser/shell_extension_api_impl.cc b/content/shell/browser/shell_extension_api_impl.cc
+index 9e9e042c5b..1be677a58a 100644
+--- a/content/shell/browser/shell_extension_api_impl.cc
++++ b/content/shell/browser/shell_extension_api_impl.cc
+@@ -4,17 +4,35 @@
+ 
+ #include "content/shell/browser/shell_extension_api_impl.h"
+ 
++#include <map>
+ #include <optional>
++#include <set>
++#include <string>
+ #include <utility>
+ 
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/no_destructor.h"
+ #include "base/values.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+ namespace content {
+ 
++namespace {
++
++// Process-global registry of live extension contexts, keyed by extension id, so
++// chrome.runtime.sendMessage can be routed to an extension's other contexts
++// (Wield W1c). UI-thread only (ExtensionApi is bound on the UI thread).
++using ContextRegistry = std::map<std::string, std::set<ShellExtensionApiImpl*>>;
++
++ContextRegistry& GetContextRegistry() {
++  static base::NoDestructor<ContextRegistry> registry;
++  return *registry;
++}
++
++}  // namespace
++
+ // static
+ void ShellExtensionApiImpl::Create(
+     RenderFrameHost* render_frame_host,
+@@ -24,7 +42,20 @@ void ShellExtensionApiImpl::Create(
+ }
+ 
+ ShellExtensionApiImpl::ShellExtensionApiImpl() = default;
+-ShellExtensionApiImpl::~ShellExtensionApiImpl() = default;
++
++ShellExtensionApiImpl::~ShellExtensionApiImpl() {
++  if (extension_id_.empty()) {
++    return;
++  }
++  ContextRegistry& registry = GetContextRegistry();
++  auto it = registry.find(extension_id_);
++  if (it != registry.end()) {
++    it->second.erase(this);
++    if (it->second.empty()) {
++      registry.erase(it);
++    }
++  }
++}
+ 
+ void ShellExtensionApiImpl::StorageGet(const std::string& extension_id,
+                                        StorageGetCallback callback) {
+@@ -78,4 +109,39 @@ void ShellExtensionApiImpl::StorageClear(const std::string& extension_id,
+   std::move(callback).Run();
+ }
+ 
++void ShellExtensionApiImpl::RegisterContext(
++    const std::string& extension_id,
++    mojo::PendingRemote<mojom::ExtensionApiClient> client) {
++  extension_id_ = extension_id;
++  client_.Bind(std::move(client));
++  GetContextRegistry()[extension_id_].insert(this);
++}
++
++void ShellExtensionApiImpl::SendMessage(const std::string& message_json) {
++  if (extension_id_.empty()) {
++    return;
++  }
++  // The browser stamps the sender id so a context can't impersonate another.
++  base::DictValue sender;
++  sender.Set("id", extension_id_);
++  std::string sender_json;
++  base::JSONWriter::Write(sender, &sender_json);
++
++  ContextRegistry& registry = GetContextRegistry();
++  auto it = registry.find(extension_id_);
++  if (it == registry.end()) {
++    return;
++  }
++  // Deliver to every *other* context of this extension (chrome.runtime.onMessage
++  // does not fire in the sending context).
++  for (ShellExtensionApiImpl* context : it->second) {
++    if (context == this) {
++      continue;
++    }
++    if (context->client_) {
++      context->client_->OnMessage(message_json, sender_json);
++    }
++  }
++}
++
+ }  // namespace content
+diff --git a/content/shell/browser/shell_extension_api_impl.h b/content/shell/browser/shell_extension_api_impl.h
+index e498c41536..c17bc02653 100644
+--- a/content/shell/browser/shell_extension_api_impl.h
++++ b/content/shell/browser/shell_extension_api_impl.h
+@@ -9,15 +9,21 @@
+ 
+ #include "content/shell/common/shell_extension_api.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
+ 
+ namespace content {
+ 
+ class RenderFrameHost;
+ 
+-// Browser-side implementation of the `chrome.*` transport (Wield epic, W1a).
+-// Bound once per RenderFrame; for now it backs `chrome.storage.local` with a
+-// per-extension JSON store persisted in local state, shared across every
+-// context of an extension. Built on content_shell, not //chrome/browser/extensions.
++// Browser-side implementation of the `chrome.*` transport (Wield epic). One
++// instance is created per extension context (each extension page's main world
++// and each content-script isolated world binds its own ExtensionApi pipe), and
++// is self-owned — destroyed when that context's pipe disconnects.
++//
++// It backs `chrome.storage.local` with a per-extension JSON store persisted in
++// local state (W1a), and routes `chrome.runtime` messages between an extension's
++// contexts via a process-global registry (W1c). Built on content_shell, not
++// //chrome/browser/extensions.
+ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+  public:
+   // Binder for ShellContentBrowserClient::RegisterBrowserInterfaceBindersForFrame.
+@@ -41,6 +47,17 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+                      StorageRemoveCallback callback) override;
+   void StorageClear(const std::string& extension_id,
+                     StorageClearCallback callback) override;
++  void RegisterContext(
++      const std::string& extension_id,
++      mojo::PendingRemote<mojom::ExtensionApiClient> client) override;
++  void SendMessage(const std::string& message_json) override;
++
++ private:
++  // Set once via RegisterContext; identifies which extension this context (and
++  // its message routing) belongs to. Empty until registered.
++  std::string extension_id_;
++  // Push channel back into this context's renderer for chrome.runtime.onMessage.
++  mojo::Remote<mojom::ExtensionApiClient> client_;
+ };
+ 
+ }  // namespace content
+diff --git a/content/shell/common/shell_extension_api.mojom b/content/shell/common/shell_extension_api.mojom
+index 39e2f8b16e..0297dd3dbf 100644
+--- a/content/shell/common/shell_extension_api.mojom
++++ b/content/shell/common/shell_extension_api.mojom
+@@ -4,11 +4,22 @@
+ 
+ module content.mojom;
+ 
+-// Browser-implemented, bound per RenderFrame. The browser-backed transport for
+-// our from-scratch `chrome.*` runtime (Wield epic, W1) — it replaces E5's
+-// pure-JS localStorage shim so an extension's data lives in one
+-// browser-persisted store shared across all of the extension's contexts
+-// (popup, options, background, and — once W1b lands — content scripts).
++// Browser→renderer push channel for one extension context (Wield W1c). The
++// renderer registers a pending remote per context via ExtensionApi.RegisterContext;
++// the browser uses it to deliver `chrome.runtime` messages into that context.
++interface ExtensionApiClient {
++  // Delivers a message to this context's `chrome.runtime.onMessage` listeners.
++  // `message_json` is the JSON-encoded message; `sender_json` is the JSON sender
++  // info (e.g. {"id": "<extension id>"}).
++  OnMessage(string message_json, string sender_json);
++};
++
++// Browser-implemented, bound once per extension context (each extension page's
++// main world and each content-script isolated world binds its own). The
++// browser-backed transport for our from-scratch `chrome.*` runtime (Wield epic,
++// W1) — it replaces E5's pure-JS localStorage shim so an extension's data lives
++// in one browser-persisted store, and (W1c) routes `chrome.runtime` messages
++// between all of the extension's contexts.
+ //
+ // `extension_id` identifies which extension's store to touch. Storage payloads
+ // are passed as JSON text so arbitrary extension values cross the boundary
+@@ -28,4 +39,14 @@ interface ExtensionApi {
+ 
+   // Empties the extension's store.
+   StorageClear(string extension_id) => ();
++
++  // Registers this context as belonging to `extension_id` and supplies the
++  // browser a client to push messages back (Wield W1c). Call once per context.
++  RegisterContext(string extension_id,
++                  pending_remote<ExtensionApiClient> client);
++
++  // Broadcasts `message_json` (a JSON-encoded value) to every *other* registered
++  // context of this context's extension, as chrome.runtime.onMessage. The
++  // browser supplies the sender info, so a context can't spoof another id.
++  SendMessage(string message_json);
+ };
+diff --git a/content/shell/renderer/shell_extension_context_bindings.cc b/content/shell/renderer/shell_extension_context_bindings.cc
+new file mode 100644
+index 0000000000..bf971fcb7b
+--- /dev/null
++++ b/content/shell/renderer/shell_extension_context_bindings.cc
+@@ -0,0 +1,445 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/shell/renderer/shell_extension_context_bindings.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "content/public/renderer/render_frame.h"
++#include "gin/arguments.h"
++#include "gin/converter.h"
++#include "gin/function_template.h"
++#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
++#include "v8/include/v8.h"
++
++namespace content {
++
++namespace {
++
++// The `chrome.*` shim, returned as a function expression that takes the native
++// bridge object `__api` so the bridge never lands on a page's global. The caller
++// runs it and invokes it with that object.
++//
++// runtime.id/getURL are trivial JS; `chrome.storage.local` and
++// `chrome.runtime` messaging are backed by `__api` (browser-routed), so an
++// extension's data and messages flow through one browser-side path shared by all
++// of its contexts (pages and content scripts). `__EXTENSION_ID__` is substituted
++// before injection.
++std::string BuildChromeShim(const std::string& extension_id) {
++  static const char kShim[] = R"JS(
++(function(__api) {
++  if (window.chrome && window.chrome.runtime && window.chrome.runtime.id) {
++    return;
++  }
++  var EXT_ID = "__EXTENSION_ID__";
++  var chrome = window.chrome || {};
++
++  chrome.runtime = chrome.runtime || {};
++  chrome.runtime.id = EXT_ID;
++  chrome.runtime.getURL = function(path) {
++    return "chrome-extension://" + EXT_ID + "/" +
++           String(path == null ? "" : path).replace(/^\//, "");
++  };
++
++  // Browser-routed chrome.runtime messaging (Wield W1c). sendMessage hands the
++  // message to the browser, which fans it out to this extension's other
++  // contexts; incoming messages arrive via the dispatcher registered below.
++  var listeners = [];
++  chrome.runtime.onMessage = {
++    addListener: function(fn) { if (typeof fn === "function") listeners.push(fn); },
++    removeListener: function(fn) {
++      var i = listeners.indexOf(fn);
++      if (i >= 0) listeners.splice(i, 1);
++    }
++  };
++  chrome.runtime.sendMessage = function(message, cb) {
++    if (typeof message === "function") { cb = message; message = undefined; }
++    var json;
++    try { json = JSON.stringify(message === undefined ? null : message); }
++    catch (e) { json = "null"; }
++    __api.sendMessage(json);
++    if (typeof cb === "function") { setTimeout(function() { cb(); }, 0); }
++    return Promise.resolve();
++  };
++  __api.setMessageDispatcher(function(messageJson, senderJson) {
++    var message, sender;
++    try { message = JSON.parse(messageJson); } catch (e) { message = null; }
++    try { sender = JSON.parse(senderJson); } catch (e) { sender = {}; }
++    listeners.slice().forEach(function(fn) {
++      try { fn(message, sender, function() {}); } catch (_) {}
++    });
++  });
++
++  // Browser-backed chrome.storage.local (Wield W1a). The native bridge stores
++  // and returns the extension's whole blob as JSON; the get(keys)/defaults
++  // semantics stay here in JS.
++  chrome.storage = chrome.storage || {};
++  var changeListeners = [];
++  function fireChanges(changes) {
++    if (!changeListeners.length) return;
++    changeListeners.slice().forEach(function(fn) {
++      try { fn(changes, "local"); } catch (_) {}
++    });
++  }
++  chrome.storage.local = {
++    get: function(keys, cb) {
++      if (typeof keys === "function" && cb === undefined) {
++        cb = keys; keys = null;
++      }
++      var p = __api.storageGet(EXT_ID).then(function(jsonStr) {
++        var all;
++        try { all = JSON.parse(jsonStr) || {}; } catch (e) { all = {}; }
++        var result = {};
++        if (keys == null) {
++          result = all;
++        } else if (typeof keys === "string") {
++          if (keys in all) result[keys] = all[keys];
++        } else if (Array.isArray(keys)) {
++          keys.forEach(function(k) { if (k in all) result[k] = all[k]; });
++        } else if (typeof keys === "object") {
++          Object.keys(keys).forEach(function(k) {
++            result[k] = (k in all) ? all[k] : keys[k];
++          });
++        }
++        if (typeof cb === "function") cb(result);
++        return result;
++      });
++      return p;
++    },
++    set: function(items, cb) {
++      items = items || {};
++      var p = __api.storageSet(EXT_ID, JSON.stringify(items)).then(function() {
++        var changes = {};
++        Object.keys(items).forEach(function(k) {
++          changes[k] = { newValue: items[k] };
++        });
++        fireChanges(changes);
++        if (typeof cb === "function") cb();
++      });
++      return p;
++    },
++    remove: function(keys, cb) {
++      var arr = Array.isArray(keys) ? keys : [keys];
++      var p = __api.storageRemove(EXT_ID, JSON.stringify(arr)).then(function() {
++        var changes = {};
++        arr.forEach(function(k) { changes[k] = {}; });
++        fireChanges(changes);
++        if (typeof cb === "function") cb();
++      });
++      return p;
++    },
++    clear: function(cb) {
++      var p = __api.storageClear(EXT_ID).then(function() {
++        if (typeof cb === "function") cb();
++      });
++      return p;
++    }
++  };
++  // Many extensions use chrome.storage.sync; back it with the same local store.
++  chrome.storage.sync = chrome.storage.local;
++  chrome.storage.onChanged = {
++    addListener: function(fn) {
++      if (typeof fn === "function") changeListeners.push(fn);
++    },
++    removeListener: function(fn) {
++      var i = changeListeners.indexOf(fn);
++      if (i >= 0) changeListeners.splice(i, 1);
++    }
++  };
++
++  // Minimal chrome.action stubs (full support arrives later in the epic).
++  chrome.action = chrome.action || {
++    setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
++    setTitle: function(_d, cb) { if (typeof cb === "function") cb(); },
++    onClicked: { addListener: function() {} }
++  };
++
++  window.chrome = chrome;
++})
++)JS";
++  std::string shim(kShim);
++  base::ReplaceSubstringsAfterOffset(&shim, 0, "__EXTENSION_ID__",
++                                     extension_id);
++  return shim;
++}
++
++// Resolves `resolver` (in `context`) with a v8 string built from `value`. Bound
++// into the ExtensionApi.StorageGet reply; runs on the renderer main thread.
++void ResolveWithString(v8::Isolate* isolate,
++                       v8::Global<v8::Context> context_global,
++                       v8::Global<v8::Promise::Resolver> resolver_global,
++                       const std::string& value) {
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = context_global.Get(isolate);
++  v8::Context::Scope context_scope(context);
++  // Blink runs V8 with the scoped-microtask policy, so resolving a promise
++  // (which enqueues microtasks) must happen inside a MicrotasksScope.
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
++  v8::Local<v8::String> v8str;
++  if (!v8::String::NewFromUtf8(isolate, value.c_str(), v8::NewStringType::kNormal,
++                               value.size())
++           .ToLocal(&v8str)) {
++    return;
++  }
++  // Resolution failure (e.g. detached context) is non-fatal; swallow it.
++  if (resolver->Resolve(context, v8str).IsNothing()) {
++    return;
++  }
++}
++
++// Resolves `resolver` with undefined. Bound into the set/remove/clear replies.
++void ResolveVoid(v8::Isolate* isolate,
++                 v8::Global<v8::Context> context_global,
++                 v8::Global<v8::Promise::Resolver> resolver_global) {
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = context_global.Get(isolate);
++  v8::Context::Scope context_scope(context);
++  // See ResolveWithString: promise resolution needs an open MicrotasksScope.
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
++  if (resolver->Resolve(context, v8::Undefined(isolate)).IsNothing()) {
++    return;
++  }
++}
++
++}  // namespace
++
++ShellExtensionContextBindings::ShellExtensionContextBindings(
++    RenderFrame* render_frame,
++    v8::Local<v8::Context> context,
++    const std::string& extension_id)
++    : render_frame_(render_frame),
++      extension_id_(extension_id),
++      isolate_(v8::Isolate::GetCurrent()),
++      context_(v8::Isolate::GetCurrent(), context) {}
++
++ShellExtensionContextBindings::~ShellExtensionContextBindings() = default;
++
++void ShellExtensionContextBindings::EnsureApi() {
++  if (!api_.is_bound()) {
++    render_frame_->GetBrowserInterfaceBroker().GetInterface(
++        api_.BindNewPipeAndPassReceiver());
++  }
++}
++
++void ShellExtensionContextBindings::Install() {
++  v8::HandleScope handle_scope(isolate_);
++  v8::Local<v8::Context> context = context_.Get(isolate_);
++  v8::Context::Scope context_scope(context);
++  v8::TryCatch try_catch(isolate_);
++
++  // Native bridge object passed into the shim function (never leaks to a global).
++  v8::Local<v8::Object> api = v8::Object::New(isolate_);
++  auto install_fn =
++      [&](const char* name,
++          v8::Local<v8::Value> (ShellExtensionContextBindings::*method)(
++              gin::Arguments*)) {
++        // base::Unretained is safe: these functions live in the v8 context this
++        // object backs, which is released (and this object destroyed) before the
++        // RenderFrame, so they are never invoked after `this` is gone. (A WeakPtr
++        // can't be used — base forbids binding one to a non-void-returning
++        // method.)
++        v8::Local<v8::Function> fn;
++        if (!gin::CreateFunctionTemplate(
++                 isolate_, base::BindRepeating(method, base::Unretained(this)))
++                 ->GetFunction(context)
++                 .ToLocal(&fn)) {
++          return;
++        }
++        if (api->Set(context, gin::StringToSymbol(isolate_, name), fn)
++                .IsNothing()) {
++          return;
++        }
++      };
++  install_fn("storageGet", &ShellExtensionContextBindings::StorageGet);
++  install_fn("storageSet", &ShellExtensionContextBindings::StorageSet);
++  install_fn("storageRemove", &ShellExtensionContextBindings::StorageRemove);
++  install_fn("storageClear", &ShellExtensionContextBindings::StorageClear);
++  install_fn("sendMessage", &ShellExtensionContextBindings::SendMessage);
++
++  // setMessageDispatcher returns void, so bind it directly.
++  {
++    v8::Local<v8::Function> fn;
++    if (gin::CreateFunctionTemplate(
++            isolate_,
++            base::BindRepeating(
++                &ShellExtensionContextBindings::SetMessageDispatcher,
++                base::Unretained(this)))
++            ->GetFunction(context)
++            .ToLocal(&fn)) {
++      if (api->Set(context,
++                   gin::StringToSymbol(isolate_, "setMessageDispatcher"), fn)
++              .IsNothing()) {
++        return;
++      }
++    }
++  }
++
++  std::string shim = BuildChromeShim(extension_id_);
++  v8::Local<v8::String> source;
++  if (!v8::String::NewFromUtf8(isolate_, shim.c_str(),
++                               v8::NewStringType::kNormal, shim.size())
++           .ToLocal(&source)) {
++    return;
++  }
++  v8::Local<v8::Script> script;
++  if (!v8::Script::Compile(context, source).ToLocal(&script)) {
++    return;
++  }
++  v8::Local<v8::Value> fn_value;
++  // Errors in the shim are non-fatal; just swallow them.
++  if (!script->Run(context).ToLocal(&fn_value) || !fn_value->IsFunction()) {
++    return;
++  }
++  v8::Local<v8::Function> shim_fn = fn_value.As<v8::Function>();
++  v8::Local<v8::Value> argv[] = {api};
++  v8::Local<v8::Value> ignored;
++  if (!shim_fn->Call(context, context->Global(), 1, argv).ToLocal(&ignored)) {
++    return;
++  }
++
++  // Register this context for message routing now that its dispatcher is set.
++  EnsureApi();
++  api_->RegisterContext(extension_id_,
++                        client_receiver_.BindNewPipeAndPassRemote());
++}
++
++void ShellExtensionContextBindings::OnMessage(const std::string& message_json,
++                                              const std::string& sender_json) {
++  v8::HandleScope handle_scope(isolate_);
++  v8::Local<v8::Context> context = context_.Get(isolate_);
++  v8::Context::Scope context_scope(context);
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  if (message_dispatcher_.IsEmpty()) {
++    return;
++  }
++  v8::Local<v8::Function> dispatcher = message_dispatcher_.Get(isolate_);
++  v8::Local<v8::String> msg;
++  v8::Local<v8::String> sender;
++  if (!v8::String::NewFromUtf8(isolate_, message_json.c_str(),
++                               v8::NewStringType::kNormal, message_json.size())
++           .ToLocal(&msg) ||
++      !v8::String::NewFromUtf8(isolate_, sender_json.c_str(),
++                               v8::NewStringType::kNormal, sender_json.size())
++           .ToLocal(&sender)) {
++    return;
++  }
++  v8::Local<v8::Value> argv[] = {msg, sender};
++  v8::Local<v8::Value> ignored;
++  if (!dispatcher->Call(context, context->Global(), 2, argv).ToLocal(&ignored)) {
++    return;
++  }
++}
++
++void ShellExtensionContextBindings::SetMessageDispatcher(gin::Arguments* args) {
++  v8::Local<v8::Value> value;
++  if (args->GetNext(&value) && value->IsFunction()) {
++    message_dispatcher_.Reset(isolate_, value.As<v8::Function>());
++  }
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::SendMessage(
++    gin::Arguments* args) {
++  std::string message_json;
++  args->GetNext(&message_json);
++  EnsureApi();
++  api_->SendMessage(message_json);
++  return v8::Undefined(isolate_);
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::StorageGet(
++    gin::Arguments* args) {
++  std::string extension_id;
++  args->GetNext(&extension_id);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->StorageGet(
++      extension_id,
++      base::BindOnce(&ResolveWithString, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::StorageSet(
++    gin::Arguments* args) {
++  std::string extension_id;
++  std::string items_json;
++  args->GetNext(&extension_id);
++  args->GetNext(&items_json);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->StorageSet(
++      extension_id, items_json,
++      base::BindOnce(&ResolveVoid, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::StorageRemove(
++    gin::Arguments* args) {
++  std::string extension_id;
++  std::string keys_json;
++  args->GetNext(&extension_id);
++  args->GetNext(&keys_json);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->StorageRemove(
++      extension_id, keys_json,
++      base::BindOnce(&ResolveVoid, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++v8::Local<v8::Value> ShellExtensionContextBindings::StorageClear(
++    gin::Arguments* args) {
++  std::string extension_id;
++  args->GetNext(&extension_id);
++
++  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver;
++  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
++    return v8::Undefined(isolate_);
++  }
++  v8::Local<v8::Promise> promise = resolver->GetPromise();
++
++  EnsureApi();
++  api_->StorageClear(
++      extension_id,
++      base::BindOnce(&ResolveVoid, isolate_.get(),
++                     v8::Global<v8::Context>(isolate_, context),
++                     v8::Global<v8::Promise::Resolver>(isolate_, resolver)));
++  return promise;
++}
++
++}  // namespace content
+diff --git a/content/shell/renderer/shell_extension_context_bindings.h b/content/shell/renderer/shell_extension_context_bindings.h
+new file mode 100644
+index 0000000000..948ffac7bb
+--- /dev/null
++++ b/content/shell/renderer/shell_extension_context_bindings.h
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_SHELL_RENDERER_SHELL_EXTENSION_CONTEXT_BINDINGS_H_
++#define CONTENT_SHELL_RENDERER_SHELL_EXTENSION_CONTEXT_BINDINGS_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "content/shell/common/shell_extension_api.mojom.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "v8/include/v8-forward.h"
++#include "v8/include/v8-persistent-handle.h"
++
++namespace gin {
++class Arguments;
++}  // namespace gin
++
++namespace content {
++
++class RenderFrame;
++
++// The renderer half of the browser-backed `chrome.*` runtime, instantiated once
++// per extension context — an extension page's main world or a content-script
++// isolated world (Wield epic). It owns that context's ExtensionApi pipe to the
++// browser, installs the native `chrome.storage` + `chrome.runtime` messaging
++// bridge into the v8 context (via gin), and receives pushed runtime messages on
++// its ExtensionApiClient receiver to dispatch into the context's onMessage
++// listeners.
++//
++// Lifetime is tied to the v8 context: the owning ShellRenderFrameObserver
++// creates one in DidCreateScriptContext and destroys it in
++// WillReleaseScriptContext, which drops both pipes and removes the context from
++// the browser's routing registry.
++class ShellExtensionContextBindings : public mojom::ExtensionApiClient {
++ public:
++  ShellExtensionContextBindings(RenderFrame* render_frame,
++                                v8::Local<v8::Context> context,
++                                const std::string& extension_id);
++  ~ShellExtensionContextBindings() override;
++
++  ShellExtensionContextBindings(const ShellExtensionContextBindings&) = delete;
++  ShellExtensionContextBindings& operator=(
++      const ShellExtensionContextBindings&) = delete;
++
++  // Builds the native bridge object, runs the `chrome.*` shim with it, and
++  // registers this context with the browser for message routing.
++  void Install();
++
++  // mojom::ExtensionApiClient:
++  void OnMessage(const std::string& message_json,
++                 const std::string& sender_json) override;
++
++ private:
++  // gin-bound native functions exposed to the shim. The storage ones return a JS
++  // Promise; sendMessage returns undefined; setMessageDispatcher stores the JS
++  // callback the shim uses to deliver incoming messages to onMessage listeners.
++  v8::Local<v8::Value> StorageGet(gin::Arguments* args);
++  v8::Local<v8::Value> StorageSet(gin::Arguments* args);
++  v8::Local<v8::Value> StorageRemove(gin::Arguments* args);
++  v8::Local<v8::Value> StorageClear(gin::Arguments* args);
++  v8::Local<v8::Value> SendMessage(gin::Arguments* args);
++  void SetMessageDispatcher(gin::Arguments* args);
++
++  // Lazily binds the ExtensionApi pipe to the browser.
++  void EnsureApi();
++
++  raw_ptr<RenderFrame> render_frame_;  // Outlives this (via observer's map).
++  std::string extension_id_;
++  raw_ptr<v8::Isolate> isolate_;
++  v8::Global<v8::Context> context_;
++  // The shim's JS function that fans an incoming message out to onMessage
++  // listeners; set via SetMessageDispatcher.
++  v8::Global<v8::Function> message_dispatcher_;
++
++  mojo::Remote<mojom::ExtensionApi> api_;
++  mojo::Receiver<mojom::ExtensionApiClient> client_receiver_{this};
++};
++
++}  // namespace content
++
++#endif  // CONTENT_SHELL_RENDERER_SHELL_EXTENSION_CONTEXT_BINDINGS_H_
+diff --git a/content/shell/renderer/shell_render_frame_observer.cc b/content/shell/renderer/shell_render_frame_observer.cc
+index 847bb6cd35..f76858a2e0 100644
+--- a/content/shell/renderer/shell_render_frame_observer.cc
++++ b/content/shell/renderer/shell_render_frame_observer.cc
+@@ -4,20 +4,19 @@
+ 
+ #include "content/shell/renderer/shell_render_frame_observer.h"
+ 
++#include <memory>
++#include <string>
+ #include <string_view>
+ #include <utility>
+ 
+ #include "base/command_line.h"
+ #include "base/functional/bind.h"
+-#include "base/strings/string_util.h"
+ #include "content/public/renderer/render_frame.h"
+-#include "gin/arguments.h"
+-#include "gin/converter.h"
+-#include "gin/function_template.h"
+ #include "content/public/renderer/render_frame_observer.h"
+ #include "content/shell/common/render_frame_test_helper.mojom.h"
+ #include "content/shell/common/shell_switches.h"
+ #include "content/shell/renderer/render_frame_test_helper.h"
++#include "content/shell/renderer/shell_extension_context_bindings.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/web_string.h"
+ #include "third_party/blink/public/web/web_document.h"
+@@ -122,211 +121,6 @@ bool ScriptMatchesUrl(const mojom::ContentScript& script, const GURL& url) {
+   return false;
+ }
+ 
+-// The `chrome.*` API shim injected into an extension page's main world. Returned
+-// as a function expression taking the native bridge object `__api` (installed by
+-// InstallChromeApi); the caller runs it and invokes it with that object so the
+-// bridge never leaks onto the page's global.
+-//
+-// runtime.id/getURL are trivial JS; `chrome.storage.local` is now backed by the
+-// browser via `__api` (Wield W1a) so an extension's data is one store shared
+-// across all its contexts and persisted by the browser. runtime messaging is
+-// delivered between same-origin extension contexts via the localStorage `storage`
+-// event on extension pages (`messaging_enabled`), and stubbed in content-script
+-// worlds until browser-routed messaging lands (W1c). `__EXTENSION_ID__` and
+-// `__MESSAGING_ENABLED__` are substituted before injection.
+-std::string BuildChromeShim(const std::string& extension_id,
+-                            bool messaging_enabled) {
+-  static const char kShim[] = R"JS(
+-(function(__api) {
+-  if (window.chrome && window.chrome.runtime && window.chrome.runtime.id) {
+-    return;
+-  }
+-  var EXT_ID = "__EXTENSION_ID__";
+-  var NS = "__shellext_" + EXT_ID;
+-  var chrome = window.chrome || {};
+-
+-  chrome.runtime = chrome.runtime || {};
+-  chrome.runtime.id = EXT_ID;
+-  chrome.runtime.getURL = function(path) {
+-    return "chrome-extension://" + EXT_ID + "/" +
+-           String(path == null ? "" : path).replace(/^\//, "");
+-  };
+-
+-  // chrome.runtime messaging. On extension pages (MSG_PAGE) it crosses
+-  // same-origin contexts (popup, options, background) via a localStorage mailbox
+-  // + the cross-document storage event. In content-script worlds the page's
+-  // localStorage is the wrong origin, so messaging is a no-op stub here until
+-  // browser-routed messaging lands (W1c) — listeners are still accepted so
+-  // extensions that register handlers load cleanly.
+-  var MSG_PAGE = __MESSAGING_ENABLED__;
+-  var listeners = [];
+-  chrome.runtime.onMessage = {
+-    addListener: function(fn) { if (typeof fn === "function") listeners.push(fn); },
+-    removeListener: function(fn) {
+-      var i = listeners.indexOf(fn);
+-      if (i >= 0) listeners.splice(i, 1);
+-    }
+-  };
+-  chrome.runtime.sendMessage = function(message, cb) {
+-    if (MSG_PAGE) {
+-      var envelope = { from: EXT_ID, message: message,
+-                       nonce: Date.now() + ":" + Math.random() };
+-      try { localStorage.setItem(NS + "_mailbox", JSON.stringify(envelope)); }
+-      catch (e) {}
+-    }
+-    if (typeof cb === "function") { setTimeout(function() { cb(); }, 0); }
+-    return Promise.resolve();
+-  };
+-  if (MSG_PAGE) {
+-    window.addEventListener("storage", function(e) {
+-      if (e.key !== NS + "_mailbox" || !e.newValue) return;
+-      var env;
+-      try { env = JSON.parse(e.newValue); } catch (_) { return; }
+-      var sender = { id: EXT_ID };
+-      listeners.slice().forEach(function(fn) {
+-        try { fn(env.message, sender, function() {}); } catch (_) {}
+-      });
+-    });
+-  }
+-
+-  // Browser-backed chrome.storage.local (Wield W1a). The native bridge stores
+-  // and returns the extension's whole blob as JSON; the get(keys)/defaults
+-  // semantics stay here in JS.
+-  chrome.storage = chrome.storage || {};
+-  var changeListeners = [];
+-  function fireChanges(changes) {
+-    if (!changeListeners.length) return;
+-    changeListeners.slice().forEach(function(fn) {
+-      try { fn(changes, "local"); } catch (_) {}
+-    });
+-  }
+-  chrome.storage.local = {
+-    get: function(keys, cb) {
+-      if (typeof keys === "function" && cb === undefined) {
+-        cb = keys; keys = null;
+-      }
+-      var p = __api.storageGet(EXT_ID).then(function(jsonStr) {
+-        var all;
+-        try { all = JSON.parse(jsonStr) || {}; } catch (e) { all = {}; }
+-        var result = {};
+-        if (keys == null) {
+-          result = all;
+-        } else if (typeof keys === "string") {
+-          if (keys in all) result[keys] = all[keys];
+-        } else if (Array.isArray(keys)) {
+-          keys.forEach(function(k) { if (k in all) result[k] = all[k]; });
+-        } else if (typeof keys === "object") {
+-          Object.keys(keys).forEach(function(k) {
+-            result[k] = (k in all) ? all[k] : keys[k];
+-          });
+-        }
+-        if (typeof cb === "function") cb(result);
+-        return result;
+-      });
+-      return p;
+-    },
+-    set: function(items, cb) {
+-      items = items || {};
+-      var p = __api.storageSet(EXT_ID, JSON.stringify(items)).then(function() {
+-        var changes = {};
+-        Object.keys(items).forEach(function(k) {
+-          changes[k] = { newValue: items[k] };
+-        });
+-        fireChanges(changes);
+-        if (typeof cb === "function") cb();
+-      });
+-      return p;
+-    },
+-    remove: function(keys, cb) {
+-      var arr = Array.isArray(keys) ? keys : [keys];
+-      var p = __api.storageRemove(EXT_ID, JSON.stringify(arr)).then(function() {
+-        var changes = {};
+-        arr.forEach(function(k) { changes[k] = {}; });
+-        fireChanges(changes);
+-        if (typeof cb === "function") cb();
+-      });
+-      return p;
+-    },
+-    clear: function(cb) {
+-      var p = __api.storageClear(EXT_ID).then(function() {
+-        if (typeof cb === "function") cb();
+-      });
+-      return p;
+-    }
+-  };
+-  // Many extensions use chrome.storage.sync; back it with the same local store.
+-  chrome.storage.sync = chrome.storage.local;
+-  chrome.storage.onChanged = {
+-    addListener: function(fn) {
+-      if (typeof fn === "function") changeListeners.push(fn);
+-    },
+-    removeListener: function(fn) {
+-      var i = changeListeners.indexOf(fn);
+-      if (i >= 0) changeListeners.splice(i, 1);
+-    }
+-  };
+-
+-  // Minimal chrome.action stubs (full support arrives with the browser-backed
+-  // API bridge / background worker).
+-  chrome.action = chrome.action || {
+-    setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
+-    setTitle: function(_d, cb) { if (typeof cb === "function") cb(); },
+-    onClicked: { addListener: function() {} }
+-  };
+-
+-  window.chrome = chrome;
+-})
+-)JS";
+-  std::string shim(kShim);
+-  base::ReplaceSubstringsAfterOffset(&shim, 0, "__EXTENSION_ID__",
+-                                     extension_id);
+-  base::ReplaceSubstringsAfterOffset(&shim, 0, "__MESSAGING_ENABLED__",
+-                                     messaging_enabled ? "true" : "false");
+-  return shim;
+-}
+-
+-// Resolves `resolver` (in `context`) with a v8 string built from `value`. Bound
+-// into the ExtensionApi.StorageGet reply; runs on the renderer main thread.
+-void ResolveWithString(v8::Isolate* isolate,
+-                       v8::Global<v8::Context> context_global,
+-                       v8::Global<v8::Promise::Resolver> resolver_global,
+-                       const std::string& value) {
+-  v8::HandleScope handle_scope(isolate);
+-  v8::Local<v8::Context> context = context_global.Get(isolate);
+-  v8::Context::Scope context_scope(context);
+-  // Blink runs V8 with the scoped-microtask policy, so resolving a promise
+-  // (which enqueues microtasks) must happen inside a MicrotasksScope.
+-  v8::MicrotasksScope microtasks_scope(context,
+-                                       v8::MicrotasksScope::kRunMicrotasks);
+-  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
+-  v8::Local<v8::String> v8str;
+-  if (!v8::String::NewFromUtf8(isolate, value.c_str(), v8::NewStringType::kNormal,
+-                               value.size())
+-           .ToLocal(&v8str)) {
+-    return;
+-  }
+-  // Resolution failure (e.g. detached context) is non-fatal; swallow it.
+-  if (resolver->Resolve(context, v8str).IsNothing()) {
+-    return;
+-  }
+-}
+-
+-// Resolves `resolver` with undefined. Bound into the set/remove/clear replies.
+-void ResolveVoid(v8::Isolate* isolate,
+-                 v8::Global<v8::Context> context_global,
+-                 v8::Global<v8::Promise::Resolver> resolver_global) {
+-  v8::HandleScope handle_scope(isolate);
+-  v8::Local<v8::Context> context = context_global.Get(isolate);
+-  v8::Context::Scope context_scope(context);
+-  // See ResolveWithString: promise resolution needs an open MicrotasksScope.
+-  v8::MicrotasksScope microtasks_scope(context,
+-                                       v8::MicrotasksScope::kRunMicrotasks);
+-  v8::Local<v8::Promise::Resolver> resolver = resolver_global.Get(isolate);
+-  if (resolver->Resolve(context, v8::Undefined(isolate)).IsNothing()) {
+-    return;
+-  }
+-}
+-
+ }  // namespace
+ 
+ ShellRenderFrameObserver::ShellRenderFrameObserver(RenderFrame* render_frame)
+@@ -411,8 +205,7 @@ void ShellRenderFrameObserver::OnContentScripts(
+   }
+ }
+ 
+-void ShellRenderFrameObserver::HandleRunAt(
+-    mojom::ContentScriptRunAt run_at) {
++void ShellRenderFrameObserver::HandleRunAt(mojom::ContentScriptRunAt run_at) {
+   stages_reached_ |= RunAtBit(run_at);
+   if (scripts_loaded_) {
+     InjectForRunAt(run_at);
+@@ -445,6 +238,7 @@ void ShellRenderFrameObserver::InjectForRunAt(
+ void ShellRenderFrameObserver::DidCreateScriptContext(
+     v8::Local<v8::Context> context,
+     int32_t world_id) {
++  std::string extension_id;
+   if (world_id == 0) {
+     // Main world: install chrome.* only for extension pages (popup, options,
+     // background), identified by the chrome-extension origin.
+@@ -456,178 +250,28 @@ void ShellRenderFrameObserver::DidCreateScriptContext(
+     if (!url.SchemeIs("chrome-extension") || url.host().empty()) {
+       return;
+     }
+-    InstallChromeApi(context, std::string(url.host()),
+-                     /*is_content_script=*/false);
+-    return;
+-  }
+-
+-  // Isolated world: if it's one of our content-script worlds, install the
+-  // owning extension's chrome.* so the content script can use it (Wield W1b).
+-  auto it = world_to_extension_.find(world_id);
+-  if (it == world_to_extension_.end()) {
+-    return;
+-  }
+-  InstallChromeApi(context, it->second, /*is_content_script=*/true);
+-}
+-
+-void ShellRenderFrameObserver::InstallChromeApi(
+-    v8::Local<v8::Context> context,
+-    const std::string& extension_id,
+-    bool is_content_script) {
+-  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+-  v8::HandleScope handle_scope(isolate);
+-  v8::Context::Scope context_scope(context);
+-  v8::TryCatch try_catch(isolate);
+-
+-  // Build the native bridge object (chrome.storage transport) bound to this
+-  // frame's observer; it is passed into the shim function so it never lands on
+-  // the page's global.
+-  v8::Local<v8::Object> api = v8::Object::New(isolate);
+-  auto install_fn = [&](const char* name,
+-                        v8::Local<v8::Value> (ShellRenderFrameObserver::*method)(
+-                            gin::Arguments*)) {
+-    // base::Unretained is safe: these functions live in the frame's v8 context,
+-    // which is torn down before the RenderFrame (and thus this observer), so
+-    // they are never invoked after `this` is gone. (A WeakPtr can't be used —
+-    // base forbids binding one to a method with a non-void return.)
+-    v8::Local<v8::Function> fn;
+-    if (!gin::CreateFunctionTemplate(
+-             isolate, base::BindRepeating(method, base::Unretained(this)))
+-             ->GetFunction(context)
+-             .ToLocal(&fn)) {
+-      return;
+-    }
+-    if (api->Set(context, gin::StringToSymbol(isolate, name), fn).IsNothing()) {
++    extension_id = std::string(url.host());
++  } else {
++    // Isolated world: install chrome.* if it's one of our content-script worlds.
++    auto it = world_to_extension_.find(world_id);
++    if (it == world_to_extension_.end()) {
+       return;
+     }
+-  };
+-  install_fn("storageGet", &ShellRenderFrameObserver::StorageGet);
+-  install_fn("storageSet", &ShellRenderFrameObserver::StorageSet);
+-  install_fn("storageRemove", &ShellRenderFrameObserver::StorageRemove);
+-  install_fn("storageClear", &ShellRenderFrameObserver::StorageClear);
+-
+-  std::string shim =
+-      BuildChromeShim(extension_id, /*messaging_enabled=*/!is_content_script);
+-  v8::Local<v8::String> source;
+-  if (!v8::String::NewFromUtf8(isolate, shim.c_str(),
+-                               v8::NewStringType::kNormal, shim.size())
+-           .ToLocal(&source)) {
+-    return;
+-  }
+-  v8::Local<v8::Script> script;
+-  if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+-    return;
+-  }
+-  v8::Local<v8::Value> fn_value;
+-  // Errors in the shim are non-fatal; just swallow them.
+-  if (!script->Run(context).ToLocal(&fn_value) || !fn_value->IsFunction()) {
+-    return;
+-  }
+-  v8::Local<v8::Function> shim_fn = fn_value.As<v8::Function>();
+-  v8::Local<v8::Value> argv[] = {api};
+-  v8::Local<v8::Value> ignored;
+-  if (!shim_fn->Call(context, context->Global(), 1, argv).ToLocal(&ignored)) {
+-    return;
+-  }
+-}
+-
+-void ShellRenderFrameObserver::EnsureExtensionApi() {
+-  if (!extension_api_.is_bound()) {
+-    render_frame()->GetBrowserInterfaceBroker().GetInterface(
+-        extension_api_.BindNewPipeAndPassReceiver());
+-  }
+-}
+-
+-v8::Local<v8::Value> ShellRenderFrameObserver::StorageGet(
+-    gin::Arguments* args) {
+-  v8::Isolate* isolate = args->isolate();
+-  std::string extension_id;
+-  args->GetNext(&extension_id);
+-
+-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+-  v8::Local<v8::Promise::Resolver> resolver;
+-  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+-    return v8::Undefined(isolate);
++    extension_id = it->second;
+   }
+-  v8::Local<v8::Promise> promise = resolver->GetPromise();
+-
+-  EnsureExtensionApi();
+-  extension_api_->StorageGet(
+-      extension_id,
+-      base::BindOnce(&ResolveWithString, isolate,
+-                     v8::Global<v8::Context>(isolate, context),
+-                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
+-  return promise;
+-}
+ 
+-v8::Local<v8::Value> ShellRenderFrameObserver::StorageSet(
+-    gin::Arguments* args) {
+-  v8::Isolate* isolate = args->isolate();
+-  std::string extension_id;
+-  std::string items_json;
+-  args->GetNext(&extension_id);
+-  args->GetNext(&items_json);
+-
+-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+-  v8::Local<v8::Promise::Resolver> resolver;
+-  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+-    return v8::Undefined(isolate);
+-  }
+-  v8::Local<v8::Promise> promise = resolver->GetPromise();
+-
+-  EnsureExtensionApi();
+-  extension_api_->StorageSet(
+-      extension_id, items_json,
+-      base::BindOnce(&ResolveVoid, isolate,
+-                     v8::Global<v8::Context>(isolate, context),
+-                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
+-  return promise;
++  auto bindings = std::make_unique<ShellExtensionContextBindings>(
++      render_frame(), context, extension_id);
++  bindings->Install();
++  context_bindings_[world_id] = std::move(bindings);
+ }
+ 
+-v8::Local<v8::Value> ShellRenderFrameObserver::StorageRemove(
+-    gin::Arguments* args) {
+-  v8::Isolate* isolate = args->isolate();
+-  std::string extension_id;
+-  std::string keys_json;
+-  args->GetNext(&extension_id);
+-  args->GetNext(&keys_json);
+-
+-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+-  v8::Local<v8::Promise::Resolver> resolver;
+-  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+-    return v8::Undefined(isolate);
+-  }
+-  v8::Local<v8::Promise> promise = resolver->GetPromise();
+-
+-  EnsureExtensionApi();
+-  extension_api_->StorageRemove(
+-      extension_id, keys_json,
+-      base::BindOnce(&ResolveVoid, isolate,
+-                     v8::Global<v8::Context>(isolate, context),
+-                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
+-  return promise;
+-}
+-
+-v8::Local<v8::Value> ShellRenderFrameObserver::StorageClear(
+-    gin::Arguments* args) {
+-  v8::Isolate* isolate = args->isolate();
+-  std::string extension_id;
+-  args->GetNext(&extension_id);
+-
+-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+-  v8::Local<v8::Promise::Resolver> resolver;
+-  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+-    return v8::Undefined(isolate);
+-  }
+-  v8::Local<v8::Promise> promise = resolver->GetPromise();
+-
+-  EnsureExtensionApi();
+-  extension_api_->StorageClear(
+-      extension_id,
+-      base::BindOnce(&ResolveVoid, isolate,
+-                     v8::Global<v8::Context>(isolate, context),
+-                     v8::Global<v8::Promise::Resolver>(isolate, resolver)));
+-  return promise;
++void ShellRenderFrameObserver::WillReleaseScriptContext(
++    v8::Local<v8::Context> context,
++    int32_t world_id) {
++  // Drop this context's bindings, which closes its pipes and removes it from the
++  // browser's message-routing registry.
++  context_bindings_.erase(world_id);
+ }
+ 
+ }  // namespace content
+diff --git a/content/shell/renderer/shell_render_frame_observer.h b/content/shell/renderer/shell_render_frame_observer.h
+index 0ba5037769..6c055cf85e 100644
+--- a/content/shell/renderer/shell_render_frame_observer.h
++++ b/content/shell/renderer/shell_render_frame_observer.h
+@@ -6,22 +6,20 @@
+ #define CONTENT_SHELL_RENDERER_SHELL_RENDER_FRAME_OBSERVER_H_
+ 
+ #include <map>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "content/public/renderer/render_frame_observer.h"
+-#include "content/shell/common/shell_extension_api.mojom.h"
+ #include "content/shell/common/shell_extension_scripts.mojom.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "v8/include/v8-forward.h"
+ 
+-namespace gin {
+-class Arguments;
+-}  // namespace gin
+-
+ namespace content {
+ 
++class ShellExtensionContextBindings;
++
+ class ShellRenderFrameObserver : public RenderFrameObserver {
+  public:
+   explicit ShellRenderFrameObserver(RenderFrame* frame);
+@@ -43,33 +41,15 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void DidDispatchDOMContentLoadedEvent() override;
+   void DidFinishLoad() override;
+ 
+-  // Injects the `chrome.*` API into an extension's contexts: extension pages'
+-  // main world (Graft E5; browser-backed storage in Wield W1a) and, since Wield
+-  // W1b, content scripts' isolated worlds.
++  // Installs/tears down an extension's `chrome.*` API per v8 context. Created for
++  // extension pages' main world (Graft E5; browser-backed storage in Wield W1a)
++  // and content scripts' isolated worlds (Wield W1b); browser-routed
++  // `chrome.runtime` messaging added in W1c. The API itself lives in a
++  // ShellExtensionContextBindings owned per context.
+   void DidCreateScriptContext(v8::Local<v8::Context> context,
+                               int32_t world_id) override;
+-
+-  // Installs the native `chrome.storage` bridge object + the JS `chrome.*` shim
+-  // into `context` for the extension identified by `extension_id` (Wield W1a).
+-  // `is_content_script` selects the messaging variant: extension pages keep the
+-  // same-origin localStorage messaging (E5); content-script worlds get stubs
+-  // (browser-routed messaging arrives in W1c) so they don't touch the page's
+-  // localStorage.
+-  void InstallChromeApi(v8::Local<v8::Context> context,
+-                        const std::string& extension_id,
+-                        bool is_content_script);
+-
+-  // gin-bound native functions backing `chrome.storage.local`. Each issues an
+-  // async Mojo request to the browser-side ExtensionApi and returns a JS Promise
+-  // (resolved with the store JSON for get, undefined otherwise). The extension
+-  // id is passed as the first JS argument.
+-  v8::Local<v8::Value> StorageGet(gin::Arguments* args);
+-  v8::Local<v8::Value> StorageSet(gin::Arguments* args);
+-  v8::Local<v8::Value> StorageRemove(gin::Arguments* args);
+-  v8::Local<v8::Value> StorageClear(gin::Arguments* args);
+-
+-  // Lazily binds the per-frame ExtensionApi remote to the browser.
+-  void EnsureExtensionApi();
++  void WillReleaseScriptContext(v8::Local<v8::Context> context,
++                                int32_t world_id) override;
+ 
+   // Fetches the installed extensions' content scripts from the browser (once
+   // per frame) and caches them.
+@@ -83,13 +63,15 @@ class ShellRenderFrameObserver : public RenderFrameObserver {
+   void InjectForRunAt(mojom::ContentScriptRunAt run_at);
+ 
+   mojo::Remote<mojom::ShellExtensionScripts> extension_scripts_;
+-  // Per-frame transport for the browser-backed `chrome.*` APIs (Wield W1a).
+-  mojo::Remote<mojom::ExtensionApi> extension_api_;
+   std::vector<mojom::ContentScriptPtr> content_scripts_;
+   // Maps a content-script isolated world id to the extension that owns it, so
+   // DidCreateScriptContext can install that extension's `chrome.*` into the
+   // world (Wield W1b). Rebuilt whenever content scripts arrive.
+   std::map<int32_t, std::string> world_to_extension_;
++  // One `chrome.*` bindings object per live extension v8 context, keyed by world
++  // id; created in DidCreateScriptContext, destroyed in WillReleaseScriptContext.
++  std::map<int32_t, std::unique_ptr<ShellExtensionContextBindings>>
++      context_bindings_;
+   bool scripts_loaded_ = false;
+   // Bitmask of ContentScriptRunAt stages already reached for the current
+   // document (reset on each commit), so scripts arriving late still inject for
