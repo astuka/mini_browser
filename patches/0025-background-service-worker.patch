@@ -1,0 +1,234 @@
+diff --git a/content/shell/browser/shell_extension_url_loader_factory.cc b/content/shell/browser/shell_extension_url_loader_factory.cc
+index 7933196c4a..84a9f0c873 100644
+--- a/content/shell/browser/shell_extension_url_loader_factory.cc
++++ b/content/shell/browser/shell_extension_url_loader_factory.cc
+@@ -11,6 +11,7 @@
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
++#include "base/json/json_reader.h"
+ #include "base/strings/escape.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/task/thread_pool.h"
+@@ -31,6 +32,11 @@ namespace content {
+ 
+ namespace {
+ 
++// A synthetic resource served at chrome-extension://<id>/__shell_background.html:
++// a minimal HTML page that loads the extension's MV3 background.service_worker
++// script, so we can host it as a persistent background page (Graft epic, E6).
++constexpr char kBackgroundPagePath[] = "__shell_background.html";
++
+ // The result of resolving + reading an extension resource off-thread.
+ struct FileResult {
+   net::Error error = net::ERR_FAILED;
+@@ -38,6 +44,49 @@ struct FileResult {
+   std::string mime_type;
+ };
+ 
++// Generates the background-page wrapper HTML for an extension by reading its
++// manifest's `background.service_worker` (+ optional `background.type`). Runs on
++// a MayBlock thread pool task.
++FileResult BuildBackgroundPage(base::FilePath root) {
++  FileResult result;
++  std::string manifest_text;
++  if (!base::ReadFileToString(root.Append("manifest.json"), &manifest_text)) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++  std::optional<base::Value> parsed = base::JSONReader::Read(
++      manifest_text, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  if (!parsed || !parsed->is_dict()) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++  const base::DictValue* background = parsed->GetDict().FindDict("background");
++  const std::string* script =
++      background ? background->FindString("service_worker") : nullptr;
++  if (!script || script->empty()) {
++    result.error = net::ERR_FILE_NOT_FOUND;
++    return result;
++  }
++  // The script path comes from the extension's own manifest, but guard against
++  // characters that would break out of the HTML attribute just in case.
++  if (script->find_first_of("\"'<>") != std::string::npos) {
++    result.error = net::ERR_INVALID_RESPONSE;
++    return result;
++  }
++  const std::string* type =
++      background ? background->FindString("type") : nullptr;
++  bool is_module = type && *type == "module";
++
++  result.data =
++      "<!doctype html><meta charset=\"utf-8\"><title>background</title>\n";
++  result.data += is_module ? "<script type=\"module\" src=\"" : "<script src=\"";
++  result.data += *script;
++  result.data += "\"></script>\n";
++  result.mime_type = "text/html";
++  result.error = net::OK;
++  return result;
++}
++
+ // Looks up the on-disk root for `extension_id` in the persisted extensions
+ // store. Must run on the UI thread (touches PrefService). Returns an empty path
+ // if the extension isn't installed.
+@@ -208,6 +257,15 @@ void ShellExtensionURLLoaderFactory::CreateLoaderAndStart(
+   }
+   std::string relative_path = base::UnescapeBinaryURLComponent(path);
+ 
++  // Serve the synthetic background page (E6) instead of reading a file.
++  if (relative_path == kBackgroundPagePath) {
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++        base::BindOnce(&BuildBackgroundPage, std::move(root)),
++        base::BindOnce(&OnResourceRead, std::move(client_remote)));
++    return;
++  }
++
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
+       base::BindOnce(&ReadExtensionResource, std::move(root),
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index a35936c7dc..a0a53ce325 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -15,6 +15,10 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
+ 
+ #import "base/apple/foundation_util.h"
+ #include "base/check_op.h"
+@@ -229,6 +233,11 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   NSPanel* _extPopupPanel;               // The open extension action popup, if any.
+   std::unique_ptr<content::WebContents> _popupContents;  // Popup's web contents.
+   id _popupCloseObserver;                // NSWindowWillClose observer for popup.
++  // Persistent background pages (Graft E6): one hidden WebContents per enabled
++  // extension that declares a background script, keyed by extension id.
++  std::map<std::string, std::unique_ptr<content::WebContents>> _backgroundPages;
++  BOOL _backgroundStarted;               // Background pages launched once a
++                                         // browser context is available.
+   // When set, the next tab created is brought to the foreground (used by the
+   // "+ New Tab" button). Link/script-opened tabs (e.g. cmd+click) stay in the
+   // background and flash the strip instead.
+@@ -266,6 +275,7 @@ - (void)showSecurityDiagnostics;
+ - (void)showExtensionsManager;
+ // Extension action icons + popups (E4):
+ - (void)rebuildExtensionActions;
++- (void)rebuildBackgroundPages;
+ - (NSString*)pathForExtensionId:(NSString*)extId;
+ - (std::optional<base::Value>)readManifestForExtensionId:(NSString*)extId;
+ - (NSImage*)iconForAction:(const base::DictValue*)action
+@@ -883,6 +893,12 @@ - (void)attachContentsForShell:(content::Shell*)shell {
+     shell->web_contents()->WasShown();
+   else
+     shell->web_contents()->WasHidden();
++
++  // Launch extension background pages once a browser context is available.
++  if (!_backgroundStarted) {
++    _backgroundStarted = YES;
++    [self rebuildBackgroundPages];
++  }
+ }
+ 
+ - (void)activateTab:(TabNode*)tab {
+@@ -1760,6 +1776,7 @@ - (void)installExtensionFromDirectory:(NSString*)dir {
+   client->SetExtensions(std::move(extensions));
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
++  [self rebuildBackgroundPages];
+ }
+ 
+ - (void)loadUnpackedExtension:(id)sender {
+@@ -1796,6 +1813,7 @@ - (void)toggleExtensionEnabled:(NSButton*)sender {
+   }
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
++  [self rebuildBackgroundPages];
+ }
+ 
+ - (void)removeExtension:(NSButton*)sender {
+@@ -1809,6 +1827,7 @@ - (void)removeExtension:(NSButton*)sender {
+   client->SetExtensions(std::move(extensions));
+   [self rebuildExtensionsList];
+   [self rebuildExtensionActions];
++  [self rebuildBackgroundPages];
+ }
+ 
+ // A non-editable, borderless label used in the extensions list.
+@@ -2103,6 +2122,62 @@ - (void)rebuildExtensionActions {
+   }
+ }
+ 
++// Hosts a persistent background page (a hidden WebContents) for each enabled
++// extension that declares an MV3 background.service_worker, and tears down those
++// no longer wanted. Our reduced "background service worker" model (E6): the
++// script runs in a long-lived extension-origin document, which already gets the
++// chrome.* shim (E5). Idempotent — safe to call repeatedly.
++- (void)rebuildBackgroundPages {
++  content::Shell* active = [self activeShell];
++  content::BrowserContext* browser_context =
++      active ? active->web_contents()->GetBrowserContext() : nullptr;
++  if (!browser_context)
++    return;
++
++  // Collect enabled extensions that declare a background script.
++  std::set<std::string> wanted;
++  base::DictValue exts =
++      content::ShellContentBrowserClient::Get()->GetExtensions();
++  for (auto&& [id_key, value] : exts) {
++    if (!value.is_dict())
++      continue;
++    if (!value.GetDict().FindBool("enabled").value_or(true))
++      continue;
++    std::optional<base::Value> manifest =
++        [self readManifestForExtensionId:base::SysUTF8ToNSString(id_key)];
++    if (!manifest || !manifest->is_dict())
++      continue;
++    const base::DictValue* background =
++        manifest->GetDict().FindDict("background");
++    const std::string* sw =
++        background ? background->FindString("service_worker") : nullptr;
++    if (sw && !sw->empty())
++      wanted.insert(id_key);
++  }
++
++  // Tear down background pages that are no longer wanted.
++  for (auto it = _backgroundPages.begin(); it != _backgroundPages.end();) {
++    if (wanted.find(it->first) == wanted.end())
++      it = _backgroundPages.erase(it);
++    else
++      ++it;
++  }
++
++  // Start background pages for newly-wanted extensions.
++  for (const std::string& id : wanted) {
++    if (_backgroundPages.count(id))
++      continue;
++    GURL url("chrome-extension://" + id + "/__shell_background.html");
++    content::WebContents::CreateParams params(browser_context);
++    std::unique_ptr<content::WebContents> contents =
++        content::WebContents::Create(params);
++    contents->GetController().LoadURL(url, content::Referrer(),
++                                      ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++                                      std::string());
++    _backgroundPages[id] = std::move(contents);
++  }
++}
++
+ - (void)extensionActionClicked:(NSButton*)sender {
+   NSString* extId = sender.identifier;
+   if (!extId.length)
+@@ -2929,6 +3004,8 @@ - (BOOL)windowShouldClose:(id)sender {
+   }
+   [_tabs removeAllObjects];
+   [_flatRows removeAllObjects];
++  _backgroundPages.clear();
++  [self closeExtensionPopup];
+   _window.delegate = nil;
+   return YES;
+ }
