@@ -1,0 +1,179 @@
+diff --git a/content/shell/browser/shell_platform_delegate_mac.mm b/content/shell/browser/shell_platform_delegate_mac.mm
+index 1ac9eedcb3..9230e4dc09 100644
+--- a/content/shell/browser/shell_platform_delegate_mac.mm
++++ b/content/shell/browser/shell_platform_delegate_mac.mm
+@@ -14,6 +14,7 @@
+ #import <Cocoa/Cocoa.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
+ #include <map>
+ #include <memory>
+@@ -44,6 +45,10 @@
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/site_isolation_policy.h"
++#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
+ #include "content/public/browser/ssl_status.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+@@ -240,6 +245,8 @@ @interface TabbedShellController : NSObject <NSWindowDelegate,
+   std::map<std::string, std::unique_ptr<content::WebContents>> _backgroundPages;
+   BOOL _backgroundStarted;               // Background pages launched once a
+                                          // browser context is available.
++  NSTextField* _webStoreField;           // "Install from Web Store (by id)" input.
++  std::unique_ptr<network::SimpleURLLoader> _webStoreLoader;  // CRX download.
+   // When set, the next tab created is brought to the foreground (used by the
+   // "+ New Tab" button). Link/script-opened tabs (e.g. cmd+click) stay in the
+   // background and flash the strip instead.
+@@ -287,6 +294,8 @@ - (BOOL)registerExtensionAtPath:(NSString*)dir withId:(NSString*)extId;
+ - (void)refreshExtensionSurfaces;
+ - (void)loadPackagedExtension:(id)sender;
+ - (void)installCrxFromPath:(NSString*)crxPath;
++- (void)installFromWebStore:(id)sender;
++- (void)finishWebStoreInstallWithCrxPath:(NSString*)path;
+ - (void)showExtensionPopupForURL:(const GURL&)url anchor:(NSView*)anchor;
+ - (void)onExtensionPopupClosed;
+ - (void)closeExtensionPopup;
+@@ -310,6 +319,39 @@ - (BOOL)performBookmarkBarDrop;
+ namespace {
+ // The single shared controller for the whole process. Strong under ARC.
+ TabbedShellController* g_tab_controller = nil;
++
++// Extracts a 32-char [a-p] extension id from either a bare id or a Chrome Web
++// Store URL (".../detail/<slug>/<id>"). Returns "" if no valid id is found.
++std::string ExtractWebStoreId(std::string input) {
++  // Trim whitespace.
++  while (!input.empty() && std::isspace(static_cast<unsigned char>(input.back())))
++    input.pop_back();
++  while (!input.empty() && std::isspace(static_cast<unsigned char>(input.front())))
++    input.erase(0, 1);
++  // Drop any query/fragment.
++  input = input.substr(0, input.find_first_of("?#"));
++  // Take the last path segment if it looks like a URL/path.
++  size_t slash = input.find_last_of('/');
++  if (slash != std::string::npos)
++    input = input.substr(slash + 1);
++  // Validate: exactly 32 chars, all in a–p.
++  if (input.size() != 32)
++    return std::string();
++  for (char c : input) {
++    if (c < 'a' || c > 'p')
++      return std::string();
++  }
++  return input;
++}
++
++// SimpleURLLoader completion (UI thread): hands the downloaded CRX to the
++// controller, or signals failure with an empty path.
++void OnWebStoreCrxDownloaded(base::FilePath path) {
++  [g_tab_controller finishWebStoreInstallWithCrxPath:
++                        path.empty()
++                            ? nil
++                            : base::SysUTF8ToNSString(path.value())];
++}
+ }  // namespace
+ 
+ @implementation TabbedShellController
+@@ -1890,6 +1932,54 @@ - (void)loadPackagedExtension:(id)sender {
+     handler([panel runModal]);
+ }
+ 
++// Installs an extension by Chrome Web Store id (E9): fetches the Google-vetted
++// CRX from the public update endpoint, then runs it through the E8 verify +
++// unpack + register pipeline. We only use the legitimate public update flow.
++- (void)installFromWebStore:(id)sender {
++  std::string extension_id =
++      ExtractWebStoreId(base::SysNSStringToUTF8(_webStoreField.stringValue));
++  if (extension_id.empty()) {
++    [self showExtensionError:@"Enter a 32-character extension id, or a Chrome "
++                             @"Web Store URL."];
++    return;
++  }
++
++  content::Shell* active = [self activeShell];
++  content::BrowserContext* browser_context =
++      active ? active->web_contents()->GetBrowserContext() : nullptr;
++  if (!browser_context)
++    return;
++
++  // The public CRX update endpoint; response=redirect sends us to the CDN copy.
++  GURL url("https://clients2.google.com/service/update2/crx?response=redirect&"
++           "acceptformat=crx3&prodversion=131.0.0.0&x=id%3D" +
++           extension_id + "%26installsource%3Dondemand%26uc");
++
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = url;
++  _webStoreLoader = network::SimpleURLLoader::Create(
++      std::move(request), TRAFFIC_ANNOTATION_FOR_TESTS);
++  scoped_refptr<network::SharedURLLoaderFactory> factory =
++      browser_context->GetDefaultStoragePartition()
++          ->GetURLLoaderFactoryForBrowserProcess();
++  _webStoreField.stringValue = @"Downloading…";
++  _webStoreLoader->DownloadToTempFile(
++      factory.get(), base::BindOnce(&OnWebStoreCrxDownloaded));
++}
++
++- (void)finishWebStoreInstallWithCrxPath:(NSString*)path {
++  _webStoreLoader.reset();
++  _webStoreField.stringValue = @"";
++  if (!path.length) {
++    [self showExtensionError:@"Couldn't download that extension from the Web "
++                             @"Store. Check the id and your connection."];
++    return;
++  }
++  [self installCrxFromPath:path];
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  base::DeleteFile(base::FilePath(base::SysNSStringToUTF8(path)));
++}
++
+ - (void)loadUnpackedExtension:(id)sender {
+   NSOpenPanel* panel = [NSOpenPanel openPanel];
+   panel.canChooseFiles = NO;
+@@ -2080,7 +2170,7 @@ - (void)showExtensionsManager {
+         [NSButton buttonWithTitle:@"Load Unpacked…"
+                            target:self
+                            action:@selector(loadUnpackedExtension:)];
+-    loadBtn.frame = NSMakeRect(12, 12, 150, 30);
++    loadBtn.frame = NSMakeRect(12, 50, 150, 30);
+     loadBtn.bezelStyle = NSBezelStyleRounded;
+     loadBtn.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+     [contentView addSubview:loadBtn];
+@@ -2089,14 +2179,30 @@ - (void)showExtensionsManager {
+         [NSButton buttonWithTitle:@"Load Packaged (.crx)…"
+                            target:self
+                            action:@selector(loadPackagedExtension:)];
+-    loadCrxBtn.frame = NSMakeRect(168, 12, 180, 30);
++    loadCrxBtn.frame = NSMakeRect(168, 50, 180, 30);
+     loadCrxBtn.bezelStyle = NSBezelStyleRounded;
+     loadCrxBtn.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+     [contentView addSubview:loadCrxBtn];
+ 
++    // Install-from-Web-Store row (E9): an id/URL field + button.
++    _webStoreField = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 14, 250,
++                                                                   22)];
++    _webStoreField.placeholderString = @"Web Store id or URL";
++    _webStoreField.autoresizingMask = NSViewMaxYMargin;
++    [contentView addSubview:_webStoreField];
++
++    NSButton* webStoreBtn =
++        [NSButton buttonWithTitle:@"Install from Web Store"
++                           target:self
++                           action:@selector(installFromWebStore:)];
++    webStoreBtn.frame = NSMakeRect(270, 10, 198, 30);
++    webStoreBtn.bezelStyle = NSBezelStyleRounded;
++    webStoreBtn.autoresizingMask = NSViewMaxYMargin;
++    [contentView addSubview:webStoreBtn];
++
+     NSScrollView* scroll = [[NSScrollView alloc]
+-        initWithFrame:NSMakeRect(0, 54, frame.size.width,
+-                                 frame.size.height - 54)];
++        initWithFrame:NSMakeRect(0, 90, frame.size.width,
++                                 frame.size.height - 90)];
+     scroll.hasVerticalScroller = YES;
+     scroll.borderType = NSNoBorder;
+     scroll.drawsBackground = NO;
