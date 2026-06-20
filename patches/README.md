@@ -306,6 +306,20 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `shell_platform_delegate_mac.mm` (calls `ReloadExtensionNetRules` at startup + on changes); stacks
   on `0020`/`0021`. Note: this is the same request-interception seam the Security epic's S5 blocklist
   would use; supports `block` rules only for now (no `redirect`/`modifyHeaders`).
+- **`0027-crx-install.patch`** — **packaged (.crx) install with signature verification** (E8). The
+  Extensions manager gains a **Load Packaged (.crx)…** button. Installing a CRX verifies its CRX3
+  signature with `//components/crx_file` (`crx_file::Verify(..., VerifierFormat::CRX3, ...)`) — which
+  also returns the authoritative extension id derived from the signing public key — then locates the
+  ZIP archive after the CRX3 header (12-byte prefix + `CrxFileHeader`), unpacks it with
+  `//third_party/zlib/google:zip` (`zip::Unzip`) into a managed dir under the profile
+  (`<profile>/CRXExtensions/<id>/`), and registers it under the **signature-derived id** (so packaged
+  extensions get their real Chrome id, unlike unpacked ones which use a path hash). A
+  tampered/corrupt package fails verification and is rejected with an error. Refactors the
+  unpacked-install path to share a `registerExtensionAtPath:withId:` helper + a
+  `refreshExtensionSurfaces` helper (rebuild list/actions/background + reload net rules). Touches
+  `content/shell/BUILD.gn` (adds `//components/crx_file` + `//third_party/zlib/google:zip`) and
+  `shell_platform_delegate_mac.mm`; stacks on `0020`. Once installed, a packaged extension runs
+  through the same machinery as unpacked (`0021`–`0026`). Sets up Web-Store install-by-id next.
 
 ## Workflow
 
