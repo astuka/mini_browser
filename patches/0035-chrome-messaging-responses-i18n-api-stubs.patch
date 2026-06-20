@@ -1,0 +1,824 @@
+diff --git a/content/shell/browser/shell_extension_api_impl.cc b/content/shell/browser/shell_extension_api_impl.cc
+index d18ddf234b..ae109bb33b 100644
+--- a/content/shell/browser/shell_extension_api_impl.cc
++++ b/content/shell/browser/shell_extension_api_impl.cc
+@@ -14,6 +14,7 @@
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+@@ -40,6 +41,28 @@ ContextRegistry& GetContextRegistry() {
+   return *registry;
+ }
+ 
++// An in-flight sendMessage/tabs.sendMessage awaiting a response (Wield W4). The
++// browser assigns a global id (gid), fans the message out to `remaining`
++// receivers, and routes the first real response — or null once every receiver
++// reports no handler — back to `sender` under its renderer-local `request_id`.
++struct PendingRequest {
++  raw_ptr<ShellExtensionApiImpl> sender;
++  int32_t request_id;
++  int remaining;
++};
++
++using PendingMap = std::map<int, PendingRequest>;
++
++PendingMap& GetPendingRequests() {
++  static base::NoDestructor<PendingMap> pending;
++  return *pending;
++}
++
++int NextGid() {
++  static int g_next_gid = 1;
++  return g_next_gid++;
++}
++
+ // Serializes one tab to a chrome.tabs-style JSON object value (Wield W2).
+ base::DictValue TabInfoToValue(const ShellTabInfo& tab, int index) {
+   base::DictValue dict;
+@@ -81,13 +104,31 @@ void OnExecuteScriptResult(
+ void ShellExtensionApiImpl::Create(
+     RenderFrameHost* render_frame_host,
+     mojo::PendingReceiver<mojom::ExtensionApi> receiver) {
+-  mojo::MakeSelfOwnedReceiver(std::make_unique<ShellExtensionApiImpl>(),
+-                              std::move(receiver));
++  base::WeakPtr<WebContents> wc;
++  if (WebContents* contents =
++          WebContents::FromRenderFrameHost(render_frame_host)) {
++    wc = contents->GetWeakPtr();
++  }
++  mojo::MakeSelfOwnedReceiver(
++      std::make_unique<ShellExtensionApiImpl>(std::move(wc)),
++      std::move(receiver));
+ }
+ 
+-ShellExtensionApiImpl::ShellExtensionApiImpl() = default;
++ShellExtensionApiImpl::ShellExtensionApiImpl(
++    base::WeakPtr<WebContents> web_contents)
++    : web_contents_(std::move(web_contents)) {}
+ 
+ ShellExtensionApiImpl::~ShellExtensionApiImpl() {
++  // Drop any in-flight requests this context was the sender of, so a late
++  // response doesn't dereference a freed sender.
++  PendingMap& pending = GetPendingRequests();
++  for (auto it = pending.begin(); it != pending.end();) {
++    if (it->second.sender == this) {
++      it = pending.erase(it);
++    } else {
++      ++it;
++    }
++  }
+   if (extension_id_.empty()) {
+     return;
+   }
+@@ -161,8 +202,10 @@ void ShellExtensionApiImpl::RegisterContext(
+   GetContextRegistry()[extension_id_].insert(this);
+ }
+ 
+-void ShellExtensionApiImpl::SendMessage(const std::string& message_json) {
++void ShellExtensionApiImpl::SendMessage(const std::string& message_json,
++                                        int32_t request_id) {
+   if (extension_id_.empty()) {
++    client_->OnResponse(request_id, "null");
+     return;
+   }
+   // The browser stamps the sender id so a context can't impersonate another.
+@@ -171,21 +214,104 @@ void ShellExtensionApiImpl::SendMessage(const std::string& message_json) {
+   std::string sender_json;
+   base::JSONWriter::Write(sender, &sender_json);
+ 
++  int gid = NextGid();
++  int delivered = 0;
+   ContextRegistry& registry = GetContextRegistry();
+   auto it = registry.find(extension_id_);
+-  if (it == registry.end()) {
++  if (it != registry.end()) {
++    // Deliver to every *other* context of this extension (onMessage does not
++    // fire in the sending context).
++    for (ShellExtensionApiImpl* context : it->second) {
++      if (context == this || !context->client_) {
++        continue;
++      }
++      context->client_->OnMessage(message_json, sender_json, gid);
++      ++delivered;
++    }
++  }
++  if (delivered == 0) {
++    client_->OnResponse(request_id, "null");
+     return;
+   }
+-  // Deliver to every *other* context of this extension (chrome.runtime.onMessage
+-  // does not fire in the sending context).
+-  for (ShellExtensionApiImpl* context : it->second) {
+-    if (context == this) {
+-      continue;
+-    }
+-    if (context->client_) {
+-      context->client_->OnMessage(message_json, sender_json);
++  GetPendingRequests()[gid] = {this, request_id, delivered};
++}
++
++void ShellExtensionApiImpl::SendResponse(int32_t request_id,
++                                         const std::string& response_json) {
++  // `request_id` here is the browser-issued gid (passed to the receiver via
++  // OnMessage). Route the first response back to the original sender and close.
++  PendingMap& pending = GetPendingRequests();
++  auto it = pending.find(request_id);
++  if (it == pending.end()) {
++    return;
++  }
++  ShellExtensionApiImpl* sender = it->second.sender;
++  int32_t sender_request_id = it->second.request_id;
++  pending.erase(it);
++  if (sender->client_) {
++    sender->client_->OnResponse(sender_request_id, response_json);
++  }
++}
++
++void ShellExtensionApiImpl::SendMessageUnhandled(int32_t request_id) {
++  PendingMap& pending = GetPendingRequests();
++  auto it = pending.find(request_id);
++  if (it == pending.end()) {
++    return;
++  }
++  if (--it->second.remaining > 0) {
++    return;  // Other receivers may still respond.
++  }
++  // No receiver handled it; the sender gets null.
++  ShellExtensionApiImpl* sender = it->second.sender;
++  int32_t sender_request_id = it->second.request_id;
++  pending.erase(it);
++  if (sender->client_) {
++    sender->client_->OnResponse(sender_request_id, "null");
++  }
++}
++
++void ShellExtensionApiImpl::SendMessageToTab(int32_t tab_id,
++                                             const std::string& message_json,
++                                             int32_t request_id) {
++  if (extension_id_.empty()) {
++    client_->OnResponse(request_id, "null");
++    return;
++  }
++  WebContents* target = nullptr;
++#if BUILDFLAG(IS_MAC)
++  target = ShellGetWebContentsForTab(tab_id);
++#endif
++  base::DictValue sender;
++  sender.Set("id", extension_id_);
++  std::string sender_json;
++  base::JSONWriter::Write(sender, &sender_json);
++
++  int gid = NextGid();
++  int delivered = 0;
++  if (target) {
++    ContextRegistry& registry = GetContextRegistry();
++    auto it = registry.find(extension_id_);
++    if (it != registry.end()) {
++      for (ShellExtensionApiImpl* context : it->second) {
++        if (context == this || !context->client_) {
++          continue;
++        }
++        // Only deliver to the extension's contexts living in the target tab
++        // (its content scripts).
++        if (context->web_contents_.get() != target) {
++          continue;
++        }
++        context->client_->OnMessage(message_json, sender_json, gid);
++        ++delivered;
++      }
+     }
+   }
++  if (delivered == 0) {
++    client_->OnResponse(request_id, "null");
++    return;
++  }
++  GetPendingRequests()[gid] = {this, request_id, delivered};
+ }
+ 
+ void ShellExtensionApiImpl::TabsQuery(const std::string& query_json,
+diff --git a/content/shell/browser/shell_extension_api_impl.h b/content/shell/browser/shell_extension_api_impl.h
+index 71fe8d0de2..6b7aee1584 100644
+--- a/content/shell/browser/shell_extension_api_impl.h
++++ b/content/shell/browser/shell_extension_api_impl.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string>
+ 
++#include "base/memory/weak_ptr.h"
+ #include "content/shell/common/shell_extension_api.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -14,6 +15,7 @@
+ namespace content {
+ 
+ class RenderFrameHost;
++class WebContents;
+ 
+ // Browser-side implementation of the `chrome.*` transport (Wield epic). One
+ // instance is created per extension context (each extension page's main world
+@@ -30,7 +32,7 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+   static void Create(RenderFrameHost* render_frame_host,
+                      mojo::PendingReceiver<mojom::ExtensionApi> receiver);
+ 
+-  ShellExtensionApiImpl();
++  explicit ShellExtensionApiImpl(base::WeakPtr<WebContents> web_contents);
+   ~ShellExtensionApiImpl() override;
+ 
+   ShellExtensionApiImpl(const ShellExtensionApiImpl&) = delete;
+@@ -50,7 +52,14 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+   void RegisterContext(
+       const std::string& extension_id,
+       mojo::PendingRemote<mojom::ExtensionApiClient> client) override;
+-  void SendMessage(const std::string& message_json) override;
++  void SendMessage(const std::string& message_json,
++                   int32_t request_id) override;
++  void SendResponse(int32_t request_id,
++                    const std::string& response_json) override;
++  void SendMessageUnhandled(int32_t request_id) override;
++  void SendMessageToTab(int32_t tab_id,
++                        const std::string& message_json,
++                        int32_t request_id) override;
+   void TabsQuery(const std::string& query_json,
+                  TabsQueryCallback callback) override;
+   void TabsGet(int32_t tab_id, TabsGetCallback callback) override;
+@@ -67,6 +76,9 @@ class ShellExtensionApiImpl : public mojom::ExtensionApi {
+   // Set once via RegisterContext; identifies which extension this context (and
+   // its message routing) belongs to. Empty until registered.
+   std::string extension_id_;
++  // The tab this context lives in, for chrome.tabs.sendMessage targeting (null
++  // for non-tab contexts like the background page).
++  base::WeakPtr<WebContents> web_contents_;
+   // Push channel back into this context's renderer for chrome.runtime.onMessage.
+   mojo::Remote<mojom::ExtensionApiClient> client_;
+ };
+diff --git a/content/shell/common/shell_extension_api.mojom b/content/shell/common/shell_extension_api.mojom
+index b2908d5a60..76b13c06b5 100644
+--- a/content/shell/common/shell_extension_api.mojom
++++ b/content/shell/common/shell_extension_api.mojom
+@@ -10,8 +10,14 @@ module content.mojom;
+ interface ExtensionApiClient {
+   // Delivers a message to this context's `chrome.runtime.onMessage` listeners.
+   // `message_json` is the JSON-encoded message; `sender_json` is the JSON sender
+-  // info (e.g. {"id": "<extension id>"}).
+-  OnMessage(string message_json, string sender_json);
++  // info (e.g. {"id": "<extension id>"}). `request_id` correlates an eventual
++  // response back to the sender (Wield W4); the receiver calls SendResponse /
++  // SendMessageUnhandled with it.
++  OnMessage(string message_json, string sender_json, int32 request_id);
++
++  // Delivers a response to a sendMessage/tabs.sendMessage the sender is awaiting
++  // (Wield W4). `request_id` is the renderer-local id from the original call.
++  OnResponse(int32 request_id, string response_json);
+ };
+ 
+ // Browser-implemented, bound once per extension context (each extension page's
+@@ -48,7 +54,22 @@ interface ExtensionApi {
+   // Broadcasts `message_json` (a JSON-encoded value) to every *other* registered
+   // context of this context's extension, as chrome.runtime.onMessage. The
+   // browser supplies the sender info, so a context can't spoof another id.
+-  SendMessage(string message_json);
++  // `request_id` is the renderer-local id used to route the response back; the
++  // browser delivers exactly one OnResponse for it (the first real response, or
++  // null once every receiver reports it had no handler). (Wield W1c/W4)
++  SendMessage(string message_json, int32 request_id);
++
++  // Delivers a receiver's response for the in-flight message tagged with the
++  // browser-issued `request_id` (the value passed to OnMessage). First one wins.
++  SendResponse(int32 request_id, string response_json);
++
++  // Signals that this receiver had no handler that will respond for
++  // `request_id`; once all receivers report this, the sender gets null.
++  SendMessageUnhandled(int32 request_id);
++
++  // Like SendMessage, but delivered only to the content-script contexts in tab
++  // `tab_id` (chrome.tabs.sendMessage, Wield W4).
++  SendMessageToTab(int32 tab_id, string message_json, int32 request_id);
+ 
+   // chrome.tabs core subset (Wield W2), backed by the tabbed UI's tab model.
+   // Tab objects are returned as JSON ({id,url,title,active,windowId,index}).
+diff --git a/content/shell/renderer/shell_extension_context_bindings.cc b/content/shell/renderer/shell_extension_context_bindings.cc
+index 8e7b53eeaf..69cf7c77bf 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.cc
++++ b/content/shell/renderer/shell_extension_context_bindings.cc
+@@ -44,10 +44,13 @@ std::string BuildChromeShim(const std::string& extension_id) {
+            String(path == null ? "" : path).replace(/^\//, "");
+   };
+ 
+-  // Browser-routed chrome.runtime messaging (Wield W1c). sendMessage hands the
+-  // message to the browser, which fans it out to this extension's other
+-  // contexts; incoming messages arrive via the dispatcher registered below.
++  // Browser-routed chrome.runtime messaging with responses (Wield W1c/W4).
++  // sendMessage hands the message to the browser (which fans it to the
++  // extension's other contexts) and returns a Promise that resolves with the
++  // first response. Incoming messages/responses arrive via dispatchers below.
+   var listeners = [];
++  var pending = {};   // request_id -> { resolve, cb }
++  var nextReq = 1;
+   chrome.runtime.onMessage = {
+     addListener: function(fn) { if (typeof fn === "function") listeners.push(fn); },
+     removeListener: function(fn) {
+@@ -55,34 +58,79 @@ std::string BuildChromeShim(const std::string& extension_id) {
+       if (i >= 0) listeners.splice(i, 1);
+     }
+   };
+-  chrome.runtime.sendMessage = function(message, cb) {
+-    if (typeof message === "function") { cb = message; message = undefined; }
+-    var json;
+-    try { json = JSON.stringify(message === undefined ? null : message); }
+-    catch (e) { json = "null"; }
+-    __api.sendMessage(json);
+-    if (typeof cb === "function") { setTimeout(function() { cb(); }, 0); }
+-    return Promise.resolve();
++  function jsonify(v) {
++    try { return JSON.stringify(v === undefined ? null : v); } catch (e) { return "null"; }
++  }
++  function startRequest(cb) {
++    var rid = nextReq++;
++    var resolveFn;
++    var p = new Promise(function(res) { resolveFn = res; });
++    pending[rid] = { resolve: resolveFn, cb: (typeof cb === "function" ? cb : null) };
++    return { rid: rid, promise: p };
++  }
++  chrome.runtime.sendMessage = function(a, b, c) {
++    // Overloads: sendMessage(message[, options][, cb]) and the rarely-used
++    // sendMessage(extensionId, message[, options][, cb]).
++    var message = a, cb = b;
++    if (typeof a === "string" && arguments.length >= 2) { message = b; cb = c; }
++    if (typeof cb !== "function") {
++      cb = (typeof b === "function") ? b : ((typeof c === "function") ? c : null);
++    }
++    var req = startRequest(cb);
++    __api.sendMessage(jsonify(message), req.rid);
++    return req.promise;
+   };
+-  __api.setMessageDispatcher(function(messageJson, senderJson) {
++  // Incoming runtime message: run onMessage listeners with a sendResponse; if
++  // none responds synchronously and none keeps the channel open (returns true),
++  // tell the browser this context had no handler.
++  function deliver(messageJson, senderJson, gid) {
+     var message, sender;
+     try { message = JSON.parse(messageJson); } catch (e) { message = null; }
+     try { sender = JSON.parse(senderJson); } catch (e) { sender = {}; }
++    var responded = false, keepOpen = false;
++    function sendResponse(resp) {
++      if (responded) return; responded = true;
++      __api.sendResponse(gid, jsonify(resp));
++    }
+     listeners.slice().forEach(function(fn) {
+-      try { fn(message, sender, function() {}); } catch (_) {}
++      try { if (fn(message, sender, sendResponse) === true) keepOpen = true; }
++      catch (e) {}
+     });
++    if (!responded && !keepOpen) { __api.sendMessageUnhandled(gid); }
++  }
++  __api.setMessageDispatcher(deliver);
++  // Incoming response to one of our sendMessage/tabs.sendMessage calls.
++  __api.setResponseDispatcher(function(rid, responseJson) {
++    var pe = pending[rid];
++    if (!pe) return;
++    delete pending[rid];
++    var resp;
++    try { resp = JSON.parse(responseJson); } catch (e) { resp = undefined; }
++    if (pe.cb) { try { pe.cb(resp); } catch (e) {} }
++    pe.resolve(resp);
+   });
+ 
+   // Browser-backed chrome.storage.local (Wield W1a). The native bridge stores
+   // and returns the extension's whole blob as JSON; the get(keys)/defaults
+   // semantics stay here in JS.
+   chrome.storage = chrome.storage || {};
+-  var changeListeners = [];
++  var changeListeners = [];        // chrome.storage.onChanged (changes, area)
++  var localChangeListeners = [];   // chrome.storage.local.onChanged (changes)
+   function fireChanges(changes) {
+-    if (!changeListeners.length) return;
+     changeListeners.slice().forEach(function(fn) {
+       try { fn(changes, "local"); } catch (_) {}
+     });
++    localChangeListeners.slice().forEach(function(fn) {
++      try { fn(changes); } catch (_) {}
++    });
++  }
++  function changeEvent(list) {
++    return {
++      addListener: function(fn) { if (typeof fn === "function") list.push(fn); },
++      removeListener: function(fn) {
++        var i = list.indexOf(fn); if (i >= 0) list.splice(i, 1);
++      }
++    };
+   }
+   chrome.storage.local = {
+     get: function(keys, cb) {
+@@ -138,17 +186,12 @@ std::string BuildChromeShim(const std::string& extension_id) {
+       return p;
+     }
+   };
+-  // Many extensions use chrome.storage.sync; back it with the same local store.
++  // Per-area onChanged (chrome.storage.local.onChanged), plus the global
++  // chrome.storage.onChanged. Many extensions use chrome.storage.sync; back it
++  // with the same local store (so its onChanged is shared too).
++  chrome.storage.local.onChanged = changeEvent(localChangeListeners);
+   chrome.storage.sync = chrome.storage.local;
+-  chrome.storage.onChanged = {
+-    addListener: function(fn) {
+-      if (typeof fn === "function") changeListeners.push(fn);
+-    },
+-    removeListener: function(fn) {
+-      var i = changeListeners.indexOf(fn);
+-      if (i >= 0) changeListeners.splice(i, 1);
+-    }
+-  };
++  chrome.storage.onChanged = changeEvent(changeListeners);
+ 
+   // chrome.tabs core subset (Wield W2), backed by the native bridge. The browser
+   // returns tab objects as JSON; we parse and apply the chrome.tabs callback/
+@@ -195,6 +238,13 @@ std::string BuildChromeShim(const std::string& extension_id) {
+         return tab;
+       });
+       return p;
++    },
++    sendMessage: function(tabId, message, options, cb) {
++      // Overload: sendMessage(tabId, message[, options][, cb]).
++      if (typeof options === "function") { cb = options; }
++      var req = startRequest(cb);
++      __api.sendMessageToTab(tabId | 0, jsonify(message), req.rid);
++      return req.promise;
+     }
+   };
+ 
+@@ -230,13 +280,166 @@ std::string BuildChromeShim(const std::string& extension_id) {
+     }
+   };
+ 
+-  // Minimal chrome.action stubs (full support arrives later in the epic).
+-  chrome.action = chrome.action || {
+-    setBadgeText: function(_d, cb) { if (typeof cb === "function") cb(); },
+-    setTitle: function(_d, cb) { if (typeof cb === "function") cb(); },
+-    onClicked: { addListener: function() {} }
++  // A stub event object ({addListener/removeListener/hasListener}). Many MV3
++  // events we don't implement are registered at extension load; these keep that
++  // from throwing (the listeners simply never fire). Wield W4.
++  function evt() {
++    var ls = [];
++    return {
++      addListener: function(f) { if (typeof f === "function") ls.push(f); },
++      removeListener: function(f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
++      hasListener: function(f) { return ls.indexOf(f) >= 0; }
++    };
++  }
++  function resolved(v) {
++    return function() { return Promise.resolve(v); };
++  }
++
++  // chrome.i18n: synchronous getMessage backed by the extension's own
++  // _locales/<lang>/messages.json, loaded via same-origin sync XHR and cached
++  // (works in extension pages; degrades to "" in content scripts). Wield W4.
++  var i18nCache = null;
++  function loadLocale(loc) {
++    try {
++      var x = new XMLHttpRequest();
++      x.open("GET", "chrome-extension://" + EXT_ID + "/_locales/" + loc +
++                        "/messages.json", false);
++      x.send();
++      if (x.status === 200 || x.status === 0) return JSON.parse(x.responseText);
++    } catch (e) {}
++    return null;
++  }
++  function i18nMessages() {
++    if (i18nCache) return i18nCache;
++    var lang = navigator.language || "en";
++    i18nCache = loadLocale(lang) || loadLocale(lang.split("-")[0]) ||
++                loadLocale("en") || {};
++    return i18nCache;
++  }
++  chrome.i18n = {
++    getUILanguage: function() { return navigator.language || "en"; },
++    getAcceptLanguages: function(cb) {
++      var a = [navigator.language || "en"];
++      if (typeof cb === "function") { cb(a); return; }
++      return Promise.resolve(a);
++    },
++    getMessage: function(key, substitutions) {
++      if (key === "@@ui_locale") return (navigator.language || "en").replace("-", "_");
++      if (key === "@@extension_id") return EXT_ID;
++      if (key === "@@bidi_dir") return "ltr";
++      var entry = i18nMessages()[key];
++      if (!entry) return "";
++      var msg = entry.message || "";
++      var subs = (substitutions == null) ? []
++                 : (Array.isArray(substitutions) ? substitutions : [substitutions]);
++      if (entry.placeholders) {
++        msg = msg.replace(/\$([a-zA-Z0-9_@]+)\$/g, function(_m, name) {
++          var ph = entry.placeholders[name] || entry.placeholders[name.toLowerCase()];
++          if (!ph) return "";
++          return String(ph.content || "").replace(/\$(\d+)/g, function(_x, n) {
++            return subs[n - 1] != null ? subs[n - 1] : "";
++          });
++        });
++      }
++      return msg.replace(/\$(\d+)/g, function(_x, n) {
++        return subs[n - 1] != null ? subs[n - 1] : "";
++      });
++    }
+   };
+ 
++  // Event stubs for MV3 lifecycle/namespaces we don't fully implement, so an
++  // extension's background loads cleanly (Wield W4).
++  chrome.runtime.onInstalled = chrome.runtime.onInstalled || evt();
++  chrome.runtime.onStartup = chrome.runtime.onStartup || evt();
++  chrome.runtime.onConnect = chrome.runtime.onConnect || evt();
++  chrome.runtime.onConnectExternal = chrome.runtime.onConnectExternal || evt();
++  chrome.runtime.onMessageExternal = chrome.runtime.onMessageExternal || evt();
++  chrome.runtime.onSuspend = chrome.runtime.onSuspend || evt();
++  chrome.runtime.getPlatformInfo = chrome.runtime.getPlatformInfo ||
++      function(cb) {
++        var info = { os: "mac", arch: "arm64", nacl_arch: "arm64" };
++        if (typeof cb === "function") { setTimeout(function() { cb(info); }, 0); return; }
++        return Promise.resolve(info);
++      };
++  chrome.runtime.connect = chrome.runtime.connect || function(info) {
++    return {
++      name: (info && info.name) || "",
++      postMessage: function() {},
++      disconnect: function() {},
++      onMessage: evt(),
++      onDisconnect: evt()
++    };
++  };
++
++  if (chrome.tabs) {
++    chrome.tabs.onUpdated = chrome.tabs.onUpdated || evt();
++    chrome.tabs.onActivated = chrome.tabs.onActivated || evt();
++    chrome.tabs.onRemoved = chrome.tabs.onRemoved || evt();
++    chrome.tabs.onCreated = chrome.tabs.onCreated || evt();
++  }
++
++  chrome.commands = {
++    onCommand: evt(),
++    getAll: function(cb) {
++      if (typeof cb === "function") { cb([]); return; }
++      return Promise.resolve([]);
++    }
++  };
++
++  chrome.contextMenus = {
++    create: function(props, cb) { if (typeof cb === "function") cb(); return (props && props.id) || 0; },
++    update: function(_i, _p, cb) { if (typeof cb === "function") cb(); return Promise.resolve(); },
++    remove: function(_i, cb) { if (typeof cb === "function") cb(); return Promise.resolve(); },
++    removeAll: function(cb) { if (typeof cb === "function") cb(); return Promise.resolve(); },
++    onClicked: evt()
++  };
++
++  chrome.sidePanel = {
++    setPanelBehavior: resolved(), setOptions: resolved(),
++    getOptions: resolved({}), open: resolved()
++  };
++
++  chrome.webRequest = chrome.webRequest || {
++    onBeforeRequest: evt(), onBeforeSendHeaders: evt(), onSendHeaders: evt(),
++    onHeadersReceived: evt(), onResponseStarted: evt(), onCompleted: evt(),
++    onErrorOccurred: evt()
++  };
++
++  chrome.declarativeNetRequest = chrome.declarativeNetRequest || {
++    updateDynamicRules: resolved(), updateSessionRules: resolved(),
++    getDynamicRules: resolved([]), getSessionRules: resolved([]),
++    getEnabledRulesets: resolved([]), updateEnabledRulesets: resolved()
++  };
++
++  chrome.windows = chrome.windows || {
++    getCurrent: resolved({ id: 1, focused: true }),
++    getAll: resolved([{ id: 1, focused: true }]),
++    update: resolved({ id: 1 }), create: resolved({ id: 1 }),
++    onFocusChanged: evt(), onRemoved: evt()
++  };
++
++  chrome.permissions = chrome.permissions || {
++    contains: resolved(true), request: resolved(true),
++    getAll: resolved({ permissions: [], origins: [] }),
++    onAdded: evt(), onRemoved: evt()
++  };
++
++  // chrome.action: no-op setters (returning resolved promises) + the click event
++  // (Wield W4). Enough for extensions that configure their toolbar action.
++  chrome.action = chrome.action || {};
++  function actionNoop(name) {
++    if (!chrome.action[name]) {
++      chrome.action[name] = function(_d, cb) {
++        if (typeof cb === "function") { cb(); return; }
++        return Promise.resolve();
++      };
++    }
++  }
++  ["setBadgeText", "getBadgeText", "setBadgeBackgroundColor", "setBadgeTextColor",
++   "setTitle", "getTitle", "setIcon", "setPopup", "getPopup", "enable", "disable",
++   "openPopup"].forEach(actionNoop);
++  chrome.action.onClicked = chrome.action.onClicked || evt();
++
+   window.chrome = chrome;
+ })
+ )JS";
+@@ -341,30 +544,38 @@ void ShellExtensionContextBindings::Install() {
+   install_fn("storageSet", &ShellExtensionContextBindings::StorageSet);
+   install_fn("storageRemove", &ShellExtensionContextBindings::StorageRemove);
+   install_fn("storageClear", &ShellExtensionContextBindings::StorageClear);
+-  install_fn("sendMessage", &ShellExtensionContextBindings::SendMessage);
+   install_fn("tabsQuery", &ShellExtensionContextBindings::TabsQuery);
+   install_fn("tabsGet", &ShellExtensionContextBindings::TabsGet);
+   install_fn("tabsCreate", &ShellExtensionContextBindings::TabsCreate);
+   install_fn("tabsUpdate", &ShellExtensionContextBindings::TabsUpdate);
+   install_fn("executeScript", &ShellExtensionContextBindings::ExecuteScript);
+ 
+-  // setMessageDispatcher returns void, so bind it directly.
+-  {
+-    v8::Local<v8::Function> fn;
+-    if (gin::CreateFunctionTemplate(
+-            isolate_,
+-            base::BindRepeating(
+-                &ShellExtensionContextBindings::SetMessageDispatcher,
+-                base::Unretained(this)))
+-            ->GetFunction(context)
+-            .ToLocal(&fn)) {
+-      if (api->Set(context,
+-                   gin::StringToSymbol(isolate_, "setMessageDispatcher"), fn)
+-              .IsNothing()) {
+-        return;
+-      }
+-    }
+-  }
++  // Void-returning native functions (messaging + dispatcher registration).
++  auto install_void =
++      [&](const char* name,
++          void (ShellExtensionContextBindings::*method)(gin::Arguments*)) {
++        v8::Local<v8::Function> fn;
++        if (!gin::CreateFunctionTemplate(
++                 isolate_, base::BindRepeating(method, base::Unretained(this)))
++                 ->GetFunction(context)
++                 .ToLocal(&fn)) {
++          return;
++        }
++        if (api->Set(context, gin::StringToSymbol(isolate_, name), fn)
++                .IsNothing()) {
++          return;
++        }
++      };
++  install_void("sendMessage", &ShellExtensionContextBindings::SendMessage);
++  install_void("sendResponse", &ShellExtensionContextBindings::SendResponse);
++  install_void("sendMessageUnhandled",
++               &ShellExtensionContextBindings::SendMessageUnhandled);
++  install_void("sendMessageToTab",
++               &ShellExtensionContextBindings::SendMessageToTab);
++  install_void("setMessageDispatcher",
++               &ShellExtensionContextBindings::SetMessageDispatcher);
++  install_void("setResponseDispatcher",
++               &ShellExtensionContextBindings::SetResponseDispatcher);
+ 
+   std::string shim = BuildChromeShim(extension_id_);
+   v8::Local<v8::String> source;
+@@ -396,7 +607,8 @@ void ShellExtensionContextBindings::Install() {
+ }
+ 
+ void ShellExtensionContextBindings::OnMessage(const std::string& message_json,
+-                                              const std::string& sender_json) {
++                                              const std::string& sender_json,
++                                              int32_t request_id) {
+   v8::HandleScope handle_scope(isolate_);
+   v8::Local<v8::Context> context = context_.Get(isolate_);
+   v8::Context::Scope context_scope(context);
+@@ -416,7 +628,33 @@ void ShellExtensionContextBindings::OnMessage(const std::string& message_json,
+            .ToLocal(&sender)) {
+     return;
+   }
+-  v8::Local<v8::Value> argv[] = {msg, sender};
++  v8::Local<v8::Value> argv[] = {msg, sender,
++                                 v8::Integer::New(isolate_, request_id)};
++  v8::Local<v8::Value> ignored;
++  if (!dispatcher->Call(context, context->Global(), 3, argv).ToLocal(&ignored)) {
++    return;
++  }
++}
++
++void ShellExtensionContextBindings::OnResponse(
++    int32_t request_id,
++    const std::string& response_json) {
++  v8::HandleScope handle_scope(isolate_);
++  v8::Local<v8::Context> context = context_.Get(isolate_);
++  v8::Context::Scope context_scope(context);
++  v8::MicrotasksScope microtasks_scope(context,
++                                       v8::MicrotasksScope::kRunMicrotasks);
++  if (response_dispatcher_.IsEmpty()) {
++    return;
++  }
++  v8::Local<v8::Function> dispatcher = response_dispatcher_.Get(isolate_);
++  v8::Local<v8::String> resp;
++  if (!v8::String::NewFromUtf8(isolate_, response_json.c_str(),
++                               v8::NewStringType::kNormal, response_json.size())
++           .ToLocal(&resp)) {
++    return;
++  }
++  v8::Local<v8::Value> argv[] = {v8::Integer::New(isolate_, request_id), resp};
+   v8::Local<v8::Value> ignored;
+   if (!dispatcher->Call(context, context->Global(), 2, argv).ToLocal(&ignored)) {
+     return;
+@@ -430,13 +668,49 @@ void ShellExtensionContextBindings::SetMessageDispatcher(gin::Arguments* args) {
+   }
+ }
+ 
+-v8::Local<v8::Value> ShellExtensionContextBindings::SendMessage(
++void ShellExtensionContextBindings::SetResponseDispatcher(
++    gin::Arguments* args) {
++  v8::Local<v8::Value> value;
++  if (args->GetNext(&value) && value->IsFunction()) {
++    response_dispatcher_.Reset(isolate_, value.As<v8::Function>());
++  }
++}
++
++void ShellExtensionContextBindings::SendMessage(gin::Arguments* args) {
++  std::string message_json;
++  int32_t request_id = 0;
++  args->GetNext(&message_json);
++  args->GetNext(&request_id);
++  EnsureApi();
++  api_->SendMessage(message_json, request_id);
++}
++
++void ShellExtensionContextBindings::SendResponse(gin::Arguments* args) {
++  int32_t request_id = 0;
++  std::string response_json;
++  args->GetNext(&request_id);
++  args->GetNext(&response_json);
++  EnsureApi();
++  api_->SendResponse(request_id, response_json);
++}
++
++void ShellExtensionContextBindings::SendMessageUnhandled(
+     gin::Arguments* args) {
++  int32_t request_id = 0;
++  args->GetNext(&request_id);
++  EnsureApi();
++  api_->SendMessageUnhandled(request_id);
++}
++
++void ShellExtensionContextBindings::SendMessageToTab(gin::Arguments* args) {
++  int32_t tab_id = 0;
+   std::string message_json;
++  int32_t request_id = 0;
++  args->GetNext(&tab_id);
+   args->GetNext(&message_json);
++  args->GetNext(&request_id);
+   EnsureApi();
+-  api_->SendMessage(message_json);
+-  return v8::Undefined(isolate_);
++  api_->SendMessageToTab(tab_id, message_json, request_id);
+ }
+ 
+ v8::Local<v8::Value> ShellExtensionContextBindings::StorageGet(
+diff --git a/content/shell/renderer/shell_extension_context_bindings.h b/content/shell/renderer/shell_extension_context_bindings.h
+index 3572e5771c..53a7abe092 100644
+--- a/content/shell/renderer/shell_extension_context_bindings.h
++++ b/content/shell/renderer/shell_extension_context_bindings.h
+@@ -51,18 +51,26 @@ class ShellExtensionContextBindings : public mojom::ExtensionApiClient {
+ 
+   // mojom::ExtensionApiClient:
+   void OnMessage(const std::string& message_json,
+-                 const std::string& sender_json) override;
++                 const std::string& sender_json,
++                 int32_t request_id) override;
++  void OnResponse(int32_t request_id,
++                  const std::string& response_json) override;
+ 
+  private:
+   // gin-bound native functions exposed to the shim. The storage ones return a JS
+-  // Promise; sendMessage returns undefined; setMessageDispatcher stores the JS
+-  // callback the shim uses to deliver incoming messages to onMessage listeners.
++  // Promise; the messaging ones are fire-and-forget (responses arrive via the
++  // OnResponse push); setMessageDispatcher/setResponseDispatcher store the JS
++  // callbacks the shim uses to deliver incoming messages/responses.
+   v8::Local<v8::Value> StorageGet(gin::Arguments* args);
+   v8::Local<v8::Value> StorageSet(gin::Arguments* args);
+   v8::Local<v8::Value> StorageRemove(gin::Arguments* args);
+   v8::Local<v8::Value> StorageClear(gin::Arguments* args);
+-  v8::Local<v8::Value> SendMessage(gin::Arguments* args);
++  void SendMessage(gin::Arguments* args);
++  void SendResponse(gin::Arguments* args);
++  void SendMessageUnhandled(gin::Arguments* args);
++  void SendMessageToTab(gin::Arguments* args);
+   void SetMessageDispatcher(gin::Arguments* args);
++  void SetResponseDispatcher(gin::Arguments* args);
+ 
+   // chrome.tabs (Wield W2). Each returns a JS Promise resolving with the tab(s)
+   // as JSON (an array for query, a single object otherwise).
+@@ -85,6 +93,9 @@ class ShellExtensionContextBindings : public mojom::ExtensionApiClient {
+   // The shim's JS function that fans an incoming message out to onMessage
+   // listeners; set via SetMessageDispatcher.
+   v8::Global<v8::Function> message_dispatcher_;
++  // The shim's JS function that resolves an awaited sendMessage with its
++  // response; set via SetResponseDispatcher.
++  v8::Global<v8::Function> response_dispatcher_;
+ 
+   mojo::Remote<mojom::ExtensionApi> api_;
+   mojo::Receiver<mojom::ExtensionApiClient> client_receiver_{this};

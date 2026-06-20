@@ -445,6 +445,39 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   against the active tab and gets back `[{frameId:0, result:{title,url,h1,textLength}}]` extracted live
   from the page's DOM. **Next (W4):** `obsidian://` external-protocol launch (hand a built note URI to
   the OS) → attempt the real end-to-end clip; likely `sendResponse` too.
+- **`0034-obsidian-external-protocol-and-clipboard.patch`** — **external-protocol launch (`obsidian://`)
+  + page-JS clipboard access** (Wield epic, **W4**). Overrides
+  `ShellContentBrowserClient::HandleExternalProtocol` so a navigation to a scheme content_shell can't
+  load (e.g. `obsidian://`, `mailto:`) is handed to the OS's registered app via
+  `[[NSWorkspace sharedWorkspace] openURL:]` (new `ShellLaunchExternalURL` in the mac delegate, declared
+  in `shell_external_protocol.h`). Also flips `javascript_can_access_clipboard` + `dom_paste_enabled` on
+  in `OverrideWebPreferences` so `document.execCommand('copy')` works without a user gesture — extensions
+  like the Obsidian Web Clipper hand their built note to Obsidian through the system clipboard (a content
+  script copies the markdown, then opens `obsidian://new?...&clipboard`), which otherwise silently
+  no-ops. Touches `shell_content_browser_client.{cc,h}`, `shell_platform_delegate_mac.mm`,
+  `content/shell/BUILD.gn`, and adds `shell_external_protocol.h`; stacks on `0033`.
+- **`0035-chrome-messaging-responses-i18n-api-stubs.patch`** — **completes the `chrome.*` surface a real
+  MV3 extension needs to run** (Wield epic, **W4**): request/response messaging, `chrome.tabs.sendMessage`,
+  `chrome.i18n`, and the MV3 API stubs the Obsidian Web Clipper registers. Messaging gains **responses**:
+  `chrome.runtime.sendMessage` now returns a Promise that resolves with the receiver's `sendResponse`
+  value — the browser assigns a global id, fans the message out, routes the first real response back to
+  the sender (or `null` once every receiver reports it had no handler), and supports async responses
+  (`return true`). Adds **`chrome.tabs.sendMessage`** (background → a tab's content scripts, with
+  response) — `ShellExtensionApiImpl` now records each context's `WebContents` so it can target a tab.
+  Adds **`chrome.i18n.getMessage`/`getUILanguage`**, backed synchronously by the extension's own
+  `_locales/<lang>/messages.json` via same-origin XHR (with `$1`/placeholder substitution). Adds stubs so
+  an extension's background/popup load cleanly: event objects for `runtime.onInstalled/onConnect/…`,
+  `tabs.on*`, and namespaces `contextMenus`, `commands`, `sidePanel`, `webRequest`,
+  `declarativeNetRequest`, `windows`, `permissions`, fuller `chrome.action`, and
+  `chrome.storage.local.onChanged`. Touches `shell_extension_api.mojom`, `shell_extension_api_impl.{cc,h}`,
+  `shell_extension_context_bindings.{cc,h}`; stacks on `0034`. **Verified — the north star:** with
+  `0034`+`0035`, the **real Web-Store-installed Obsidian Web Clipper clips a live page end-to-end**. The
+  popup fully initializes (templates, properties, localized UI), extracts the active tab to markdown via
+  the background → `tabs.sendMessage` → content-script chain, and "Add to Obsidian" opens
+  `obsidian://new?...&clipboard` (content carried on the system clipboard) — producing a real note in the
+  vault's `Clippings/` folder with YAML frontmatter (title/source/created/tags) **and** the extracted
+  body. (Boundary: `executeScript` `files`/`world:'MAIN'`, `runtime.connect` ports, `sidePanel` UI, and
+  `contextMenus`/`commands` actions are stubbed/no-op, not functional.)
 
 ## Workflow
 
