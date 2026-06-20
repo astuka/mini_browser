@@ -101,8 +101,13 @@ Run it:
   extensions' static DNR rules block matching network requests (subresources included) via a proxying
   `URLLoaderFactory`, toggled live as extensions are enabled/disabled; and **packaged (.crx)
   install** — install a signed `.crx`, verifying its CRX3 signature (and rejecting tampered packages),
-  unpacking it to a managed dir, and registering it under its real key-derived id. (Web Store
-  install-by-id, and a true ephemeral service worker, come next.)
+  unpacking it to a managed dir, and registering it under its real key-derived id; and **Web Store
+  install-by-id** — paste an extension id (or Web Store URL) to fetch the Google-vetted CRX from the
+  public update endpoint and install it through the same verify pipeline (tested with the real Obsidian
+  Web Clipper). **Boundary:** install + page-loading work for real Web Store extensions, but full
+  *functionality* of a complex extension needs a much larger `chrome.*` API surface than this runtime
+  implements yet (e.g. `chrome.tabs`/`scripting`, `chrome.*` in content scripts, external protocols) —
+  a future epic.
 - ⬜ **Stage 2 — our own embedder.** Write a thin browser in `mini_browser/` against
   Chromium's `content` module (our `ContentMain`, window/tab UI, address bar), linking the
   engine rather than copying it. See `research.md` §6.

@@ -320,6 +320,23 @@ reviewable in isolation, and keeps them cleanly separated from the engine.
   `content/shell/BUILD.gn` (adds `//components/crx_file` + `//third_party/zlib/google:zip`) and
   `shell_platform_delegate_mac.mm`; stacks on `0020`. Once installed, a packaged extension runs
   through the same machinery as unpacked (`0021`–`0026`). Sets up Web-Store install-by-id next.
+- **`0028-webstore-install-by-id.patch`** — **install a Chrome Web Store extension by id** (E9, the
+  Graft finale). The Extensions manager gains a **Web Store id or URL** field + **Install from Web
+  Store** button. On submit it extracts the 32-char id (from a bare id or a `.../detail/<slug>/<id>`
+  URL), fetches the Google-vetted CRX from the public update endpoint
+  (`https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx3&prodversion=…&x=id%3D<ID>%26installsource%3Dondemand%26uc`)
+  with a `network::SimpleURLLoader` `DownloadToTempFile` (follows the redirect to the CDN), then runs
+  the downloaded CRX through the `0027` verify + unpack + register pipeline. This realizes the epic's
+  north star — discoverability + Google's vetting — by installing the exact same signed CRX the Web
+  Store serves, using only the legitimate public update flow. Touches
+  `shell_platform_delegate_mac.mm` only; stacks on `0027`. **Honest boundary (verified with the real
+  Obsidian Web Clipper, id `cnjifjpddelmedmihgijeibhnjfabmlf`):** install-by-id works end-to-end — it
+  downloads, verifies, unpacks, registers, and the popup page even loads with our `chrome.*` shim. But
+  the Clipper can't actually *clip*, because it needs APIs this runtime doesn't implement —
+  `chrome.scripting`/`activeTab`/`tabs` (to read the active page), `chrome.*` **in content scripts**
+  (its `browser-polyfill` content script), `contextMenus`/`sidePanel`/`commands`, and the `obsidian://`
+  external-protocol hand-off. Full real-extension *functionality* is a much larger `chrome.*` surface
+  than E1–E9 (a future epic); install + page-loading is what E9 proves.
 
 ## Workflow
 
